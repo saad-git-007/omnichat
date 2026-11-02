@@ -199,18 +199,31 @@ private fun read(f: File): String {
   }
 }
 
+/** Clipboard and share text both travel in one binder transaction (~1 MB): too much throws instead of failing softly. */
+private const val FALLBACK_CHARS = 100_000
+
 private fun copy(context: Context, text: String) {
   val cm = context.getSystemService(ClipboardManager::class.java)
-  cm.setPrimaryClip(ClipData.newPlainText("OmniChat log", text))
-  Toast.makeText(context, "Copied ${text.lines().size} lines", Toast.LENGTH_SHORT).show()
+  val done = runCatching { cm.setPrimaryClip(ClipData.newPlainText("OmniChat log", text)) }.isSuccess ||
+    runCatching { cm.setPrimaryClip(ClipData.newPlainText("OmniChat log", text.takeLast(FALLBACK_CHARS))) }.isSuccess.also {
+      if (it) return Toast.makeText(context, "The log was too long: copied its last ${FALLBACK_CHARS / 1000} KB", Toast.LENGTH_LONG).show()
+    }
+  Toast.makeText(context, if (done) "Copied ${text.lines().size} lines" else "Couldn't copy the log", Toast.LENGTH_SHORT).show()
 }
 
 private fun share(context: Context, tab: LogTab, text: String) {
-  val send =
-    Intent(Intent.ACTION_SEND).apply {
-      type = "text/plain"
-      putExtra(Intent.EXTRA_SUBJECT, "OmniChat ${tab.label.lowercase()} log")
-      putExtra(Intent.EXTRA_TEXT, text)
-    }
-  context.startActivity(Intent.createChooser(send, "Share log"))
+  fun send(t: String) =
+    Intent.createChooser(
+      Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "OmniChat ${tab.label.lowercase()} log")
+        putExtra(Intent.EXTRA_TEXT, t)
+      },
+      "Share log",
+    )
+  if (runCatching { context.startActivity(send(text)) }.isFailure) {
+    runCatching { context.startActivity(send(text.takeLast(FALLBACK_CHARS))) }
+      .onSuccess { Toast.makeText(context, "The log was too long: sharing its last ${FALLBACK_CHARS / 1000} KB", Toast.LENGTH_LONG).show() }
+      .onFailure { Toast.makeText(context, "Couldn't share the log", Toast.LENGTH_SHORT).show() }
+  }
 }

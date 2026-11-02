@@ -23,7 +23,16 @@ class GenerationService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val text = intent?.getStringExtra(EXTRA_TEXT) ?: "Working…"
-    startForeground(ID_PROGRESS, notification(this, text, ongoing = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+    // the "special use" type exists from Android 14; on 13 the service runs untyped
+    if (android.os.Build.VERSION.SDK_INT >= 34) startForeground(ID_PROGRESS, notification(this, text, ongoing = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+    else startForeground(ID_PROGRESS, notification(this, text, ongoing = true))
+    foreground = true
+    // stopped before it got here (a reply that failed at once): stopping it earlier would have crashed the app
+    if (stopWanted) {
+      stopWanted = false
+      stopSelf()
+      return START_NOT_STICKY
+    }
     if (wakeLock == null) {
       wakeLock = getSystemService(PowerManager::class.java)
         .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "omnichat:generation")
@@ -33,6 +42,7 @@ class GenerationService : Service() {
   }
 
   override fun onDestroy() {
+    foreground = false
     wakeLock?.takeIf { it.isHeld }?.release()
     wakeLock = null
     super.onDestroy()
@@ -58,8 +68,12 @@ class GenerationService : Service() {
 
     val appVisible: Boolean get() = started.get() > 0
 
+    @Volatile private var foreground = false
+    @Volatile private var stopWanted = false
+
     fun start(context: Context, text: String) {
       channels(context)
+      stopWanted = false
       context.getSystemService(NotificationManager::class.java).cancel(ID_DONE)
       context.startForegroundService(Intent(context, GenerationService::class.java).putExtra(EXTRA_TEXT, text))
       running = true
@@ -75,7 +89,8 @@ class GenerationService : Service() {
     fun stop(context: Context, doneText: String?) {
       if (!running) return
       running = false
-      context.stopService(Intent(context, GenerationService::class.java))
+      // a foreground service stopped before it calls startForeground takes the app down: then it stops itself
+      if (foreground) context.stopService(Intent(context, GenerationService::class.java)) else stopWanted = true
       if (doneText != null && !appVisible) {
         context.getSystemService(NotificationManager::class.java).notify(ID_DONE, notification(context, doneText, ongoing = false))
       }
@@ -121,6 +136,12 @@ class LiveTranscribeService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     startForeground(ID, GenerationService.notification(this, intent?.getStringExtra("text") ?: "Listening", ongoing = true, title = "Live transcribe"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+    foreground = true
+    if (stopWanted) {
+      stopWanted = false
+      stopSelf()
+      return START_NOT_STICKY
+    }
     if (wakeLock == null) {
       wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "omnichat:live").apply { acquire(8 * 60 * 60 * 1000L) }
     }
@@ -128,6 +149,7 @@ class LiveTranscribeService : Service() {
   }
 
   override fun onDestroy() {
+    foreground = false
     wakeLock?.takeIf { it.isHeld }?.release()
     wakeLock = null
     super.onDestroy()
@@ -135,15 +157,21 @@ class LiveTranscribeService : Service() {
 
   companion object {
     private const val ID = 3
+    @Volatile private var foreground = false
+    @Volatile private var stopWanted = false
 
     fun start(context: Context) {
       GenerationService.channels(context)
+      stopWanted = false
       context.startForegroundService(Intent(context, LiveTranscribeService::class.java))
     }
 
     fun progress(context: Context, text: String) =
       context.getSystemService(NotificationManager::class.java).notify(ID, GenerationService.notification(context, text, ongoing = true, title = "Live transcribe"))
 
-    fun stop(context: Context) = context.stopService(Intent(context, LiveTranscribeService::class.java))
+    /** Stops it, or has it stop itself once started: stopping it before startForeground takes the app down. */
+    fun stop(context: Context) {
+      if (foreground) context.stopService(Intent(context, LiveTranscribeService::class.java)) else stopWanted = true
+    }
   }
 }

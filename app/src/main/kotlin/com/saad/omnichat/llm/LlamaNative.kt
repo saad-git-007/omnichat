@@ -76,6 +76,18 @@ object LlamaNative {
 
   external fun nativeCtxSize(): Int
 
+  /** Meeting notes: a short text answer outside the chat; null on failure or when stopped by [nativeNotesAbort]. */
+  external fun nativeNotesAsk(system: String, user: String, maxTokens: Int): String?
+
+  /** true: makes a running (or the next) [nativeNotesAsk] stop early; false lets them run again. */
+  external fun nativeNotesAbort(stop: Boolean)
+
+  /** A short answer (at most [maxTokens]) about a picture, outside the chat; null on failure. */
+  external fun nativeImageQuestion(rgb: ByteArray, width: Int, height: Int, question: String, maxTokens: Int): String?
+
+  /** How many tokens the chat model reads [text] as; -1 when no model is loaded. */
+  external fun nativeTokenCount(text: String): Int
+
   /**
    * EmbeddingGemma 2 on the CPU, separate from the chat model; [mmproj] "" = text only (call again to add it). The image
    * tower runs on [encoderDevice] ("GPUOpenCL"), or the CPU when "".
@@ -93,13 +105,10 @@ object LlamaNative {
   /** Unit-length embedding of a photo, comparable with text query embeddings; null on failure. */
   external fun nativeEmbedImage(rgb: ByteArray, width: Int, height: Int): FloatArray?
 
-  /** Loads MiniCPM-OCR (text part on the CPU, image tower on [encoderDevice] or the CPU); returns where the tower runs. */
+  /** Loads the OCR model (text part on the CPU, image tower on [encoderDevice] or the CPU); returns where the tower runs. */
   external fun nativeOcrLoad(path: String, mmproj: String, encoderDevice: String, threads: Int): String?
 
   external fun nativeOcrUnload()
-
-  /** Writes a Q8_0 copy of a bf16 image tower (fast on the CPU, GPU and NPU backends); false on failure. */
-  external fun nativeMmprojToQ8(src: String, dst: String): Boolean
 
   /** true: makes a running (or the next) [nativeOcrRead] stop early; false re-arms it before a new read. */
   external fun nativeOcrStop(stop: Boolean)

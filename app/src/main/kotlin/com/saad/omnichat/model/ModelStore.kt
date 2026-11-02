@@ -11,9 +11,13 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
-data class ModelFile(val name: String, val size: Long, val sha256: String, val repo: String = "LiquidAI/LFM3-Omni-2B-GGUF") {
-  val url get() = "https://huggingface.co/$repo/resolve/main/$name"
+/** [revision]: a commit of [repo], for files a later upload could replace (the checksum would then refuse them). */
+data class ModelFile(val name: String, val size: Long, val sha256: String, val repo: String = "LiquidAI/LFM3-Omni-2B-GGUF", val revision: String = "main") {
+  val url get() = "https://huggingface.co/$repo/resolve/$revision/$name"
 }
+
+private const val OCR_REPO = "richardyoung/Xiaomi-OCR-0-GGUF"
+private const val OCR_REV = "a0cb6d2813d1bf778f06d22bb7a78e35bc4287b8"
 
 object Models {
   val MODEL = ModelFile("LFM3-Omni-2B-Q4_0.gguf", 1_049_617_920, "6d2273a383b92dd7c5db0eb4c8dfeae13e805b485a6621c4b391ae179c2b5f28")
@@ -26,11 +30,17 @@ object Models {
   /** Its image tower, in the same space as text: gallery search. Optional. */
   val EMBED_VISION = ModelFile("mmproj-embeddinggemma-2-Q8_0.gguf", 554_821_024, "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f", "ggml-org/embeddinggemma-2-GGUF")
 
-  /** OpenBMB's MiniCPM-OCR 1.0 (Apache 2.0): reads the text in scanned PDF pages and photos. Optional. */
-  val OCR = ModelFile("MiniCPM-OCR-1_0-Q4_K_M.gguf", 529_106_816, "c80a703400633f298cc2fddf6d493a541be36918c0801c0b1bf3f14c5703ce49", "openbmb/MiniCPM-OCR-1.0-gguf")
+  /**
+   * Xiaomi-OCR-0 (Apache 2.0, Qwen3.5-0.8B): reads the text in scanned PDF pages and photos, tables included. Optional.
+   * A community GGUF build (Xiaomi publishes only safetensors), pinned to the revision tested against MiniCPM-OCR.
+   */
+  val OCR = ModelFile("Xiaomi-OCR-0-Q4_K_M.gguf", 541_904_320, "70256e1482297608b25a79dbd43db794e75d38b4999b65fc4b75f9c66e348e1f", OCR_REPO, OCR_REV)
 
-  /** Its image tower. */
-  val OCR_VISION = ModelFile("mmproj-model-f16-4x.gguf", 901_017_536, "ceed82261b3b1380c3165f8b37c10117a50093be1362cbfeeb692fa036444682", "openbmb/MiniCPM-OCR-1.0-gguf")
+  /** Its image tower, in f16: fast on the CPU and OpenCL as downloaded (bf16 had to be converted on the phone). */
+  val OCR_VISION = ModelFile("mmproj-Xiaomi-OCR-0-F16.gguf", 204_987_264, "cd6a69a6fd4c36dbc5ca56bd1a5b9cfca3deb2043e645e95b8491e2fc0f29659", OCR_REPO, OCR_REV)
+
+  /** Files of the OCR model used before (MiniCPM-OCR 1.0), deleted on the first start after the switch. */
+  val OLD_OCR = listOf("MiniCPM-OCR-1_0-Q4_K_M.gguf", "mmproj-model-f16-4x.gguf", "mmproj-MiniCPM-OCR-1_0-Q8_0.gguf", "mmproj-MiniCPM-OCR-1_0-Q8_0.gguf.part")
 }
 
 /**

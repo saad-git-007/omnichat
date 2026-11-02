@@ -17,8 +17,10 @@ It was built and tuned for the **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2)
 - **Documents:** PDF, Excel (.xlsx), CSV, Markdown, JSON and plain text.
   - PDF tables are rebuilt as real tables from where each word sits on the page, so values stay under the right column.
   - Two-column pages are read column by column.
-  - Scanned pages, and pictures inside text PDFs (screenshots, photos of notes), are read with on-device OCR.
+  - Scanned pages, and pictures inside text PDFs (screenshots, photos of notes), are read with on-device OCR (Xiaomi-OCR-0), which keeps tables as tables.
+  - Photos: the chat model reads most text in a photo itself, in seconds on the NPU. A quick check sends only tables, receipts and forms (or a request for the exact text) through the OCR model as well, since that's where the chat model loses track of rows and columns.
   - Excel workbooks become exact CSV, one section per sheet, in tab order.
+  - Questions about a table get help with the reading: the app finds the rows the question names, works out exact counts and totals for a value it names ("West", "Priya") and summarises the columns it mentions, and puts these next to the question. Small sheets are given to the model one row per line with every value named, and empty cells marked. On a 41-question test this took the model from 18 to 31 correct answers.
 - **Long documents:** whatever doesn't fit in the context is indexed and searched by meaning for each question (up to 4M characters).
 - **Long recordings:** audio longer than 10 minutes is transcribed in parts, then answered from the transcript.
 - **Fast follow-ups:** the processed state of a document is cached on disk, so asking more questions about the same file starts instantly.
@@ -26,7 +28,9 @@ It was built and tuned for the **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2)
 ### Voice
 - **Voice chat:** speak, and the model answers out loud. 19 languages, female or male voice. The model generates the speech itself; there's no separate TTS engine.
 - **Dictation:** tap the mic to type by voice. Slide up to send a voice note instead.
-- **Live transcribe:** a separate page that keeps writing down what it hears. It keeps going in the background with the screen off, and you can copy or save the transcript with or without time stamps.
+- **Live transcribe:** a separate page that keeps writing down what it hears. It keeps going in the background with the screen off, and you can copy or save the transcript with or without time stamps. The block length (3–30 s) is set in Settings; scrolling up to read stops the page from jumping to new text until you come back down; quiet stretches are skipped instead of being written down as "Thank you."
+- **Meeting notes:** while live transcribe listens, action items (who, what, by when), decisions and the key points of each minute are noted between pieces, and a summary is written when you stop. Transcription always comes first: a note in progress stops the moment the next piece is ready. Action items are found by picking out sentences that sound like a request or a promise and asking the model about each one with the sentences around it; decisions are taken word for word. On scripted 10- and 30-minute meetings, with and without speech-recognition errors, it found all 26 action items and invented none.
+- **Around the transcript:** bookmarks, search, auto-save (a crash or restart loses nothing), and export as text, Markdown with the notes, or subtitles (.srt). "Ask about this meeting in chat" opens a chat with the transcript and notes attached.
 
 ### Tools the model can use
 The model decides when to use a tool. App-opening actions always stop for you to confirm in the other app, and they only run when your message actually asks for them.
@@ -85,9 +89,9 @@ Downloaded inside the app on first run from Hugging Face and checked with SHA-25
 |---|---|---|
 | LFM3-Omni-2B Q4_0 + multimodal projector Q8_0 | 1.6 GB | Chat, vision, audio, speech (required) |
 | EmbeddingGemma 2 Q8_0 (+ vision projector) | 0.3 GB (+0.55 GB) | Smart search (+ gallery search) |
-| MiniCPM-OCR 1.0 Q4_K_M + projector | 1.15 GB | Reading scanned pages and text in pictures |
+| Xiaomi-OCR-0 Q4_K_M + projector F16 | 0.75 GB | Reading scanned pages and text in pictures, tables included |
 
-The models need about 3.6 GB in total with every feature on. Chats and search indexes add only tens of MB, even after thousands of messages.
+The models need about 3.2 GB in total with every feature on. Chats and search indexes add only tens of MB, even after thousands of messages.
 
 ---
 
@@ -138,7 +142,7 @@ app/src/main/
    adb install app/build/outputs/apk/release/app-release.apk
    ```
 
-3. **Run the unit tests** (calculator, tool-call parsing and gating, PDF table layout):
+3. **Run the unit tests** (calculator, tool-call parsing and gating, PDF table layout, OCR output cleanup, table hints, speech detection, meeting notes, transcript exports):
 
    ```bash
    ./gradlew :app:testDebugUnitTest
@@ -162,7 +166,7 @@ The APK includes `x86_64` libraries so it also runs on the Android emulator, on 
 - [LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF) by Liquid AI
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp), including the mtmd multimodal library and the Hexagon backend
 - [EmbeddingGemma 2](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF) by Google
-- [MiniCPM-OCR](https://huggingface.co/openbmb/MiniCPM-OCR-1.0-gguf) by OpenBMB
+- [Xiaomi-OCR-0](https://huggingface.co/xiaomi-research/Xiaomi-OCR-0) by Xiaomi, as the [GGUF build by richardyoung](https://huggingface.co/richardyoung/Xiaomi-OCR-0-GGUF)
 - [PdfBox-Android](https://github.com/TomRoush/PdfBox-Android)
 - The orb is a Kotlin port of [Thinking Orbs](https://libraries.dev/orbs) by Jakub Antalik (MIT, license text in `ui/orbs/OrbEngine.kt`). The voice glow is a port of [Voice Glow](https://libraries.dev/voice), also by Jakub Antalik (MIT, license text in `ui/voiceglow/`).
 

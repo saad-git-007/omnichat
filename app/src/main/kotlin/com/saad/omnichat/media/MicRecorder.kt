@@ -51,6 +51,10 @@ class MicRecorder(private val rate: Int) {
             for (i in 0 until n) sum += buf[i] * buf[i]
             val db = 10 * kotlin.math.log10(sum / n + 1e-12)
             level = ((db + 50) / 40).toFloat().coerceIn(0f, 1f)
+          } else if (n < 0) {
+            // the audio server went away (ERROR_DEAD_OBJECT): reading again would spin at full speed, getting nothing
+            com.saad.omnichat.AppLog.w("mic: read failed ($n), stopping")
+            running = false
           }
         }
         level = 0f

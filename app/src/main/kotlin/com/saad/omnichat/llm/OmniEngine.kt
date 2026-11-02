@@ -28,9 +28,10 @@ sealed interface Media {
   /**
    * Text extracted from a PDF, spreadsheet or text file; it goes into the prompt, not through the encoder. A
    * document too long for the context keeps only its opening in [text] and is searched by meaning: [index] names
-   * its passages in the semantic index, and the passages that fit each question are added to it.
+   * its passages in the semantic index, and the passages that fit each question are added to it. A spreadsheet
+   * cut like that keeps all of it in [table] (never sent whole), so rows a question names are still found exactly.
    */
-  class Document(val name: String, val text: String, val truncated: Boolean = false, val index: String? = null) : Media
+  class Document(val name: String, val text: String, val truncated: Boolean = false, val index: String? = null, val table: String? = null) : Media
 
   /** [truncated]: the source was longer than the decoder keeps. */
   class Audio(val pcm: FloatArray, val truncated: Boolean = false) : Media
@@ -146,6 +147,29 @@ class OmniEngine(context: Context) {
       LlamaNative.nativeReset(systemPrompt)
       if (history.isNotEmpty()) LlamaNative.nativeSetHistory(history.map { it.first }.toTypedArray(), history.map { it.second }.toTypedArray())
     }
+
+  /**
+   * Whether a photo holds a table, receipt, price list or form: the layouts the chat model misreads (which price is
+   * on which line, which value is under which day) and the OCR model writes out exactly. Asked of the chat model on
+   * a small copy, outside the chat: well under a second on the NPU. Null when it couldn't tell.
+   */
+  suspend fun looksLikeTable(img: Media.Image): Boolean? =
+    withContext(thread) {
+      LlamaNative.nativeImageQuestion(img.rgb, img.width, img.height, TABLE_QUESTION, 3)?.trim()?.lowercase()?.let { it.startsWith("yes") }
+    }
+
+  /** Meeting notes for live transcribe, outside the chat; null when it failed or [stopNotes] cut it short. */
+  suspend fun notesAsk(system: String, user: String, maxTokens: Int): String? =
+    withContext(thread) { LlamaNative.nativeNotesAsk(system, user, maxTokens)?.replace("<think></think>", "")?.trim() }
+
+  /** Thread-safe: [stop] true cuts a running notes answer short (the next audio block comes first). */
+  fun stopNotes(stop: Boolean) = LlamaNative.nativeNotesAbort(stop)
+
+  /** Tokens the chat model reads [text] as, or null when no model is loaded. */
+  suspend fun tokenCount(text: String): Int? = withContext(thread) { LlamaNative.nativeTokenCount(text).takeIf { it >= 0 } }
+
+  /** Tokens the chat holds now, and the context size (0 before a model is loaded). */
+  suspend fun context(): Pair<Int, Int> = withContext(thread) { LlamaNative.nativeCtxUsed() to LlamaNative.nativeCtxSize() }
 
   /** Thread-safe: stops the running prefill or generation. */
   fun abort() = LlamaNative.nativeAbort()
@@ -413,3 +437,7 @@ private const val DOC_STATE_BUDGET = 2L shl 30
 
 /** Longest audio piece handed to the encoder at once (its warm-up size is 30 s). */
 const val AUDIO_PIECE_SECONDS = 60
+
+/** On test images: yes for every table, receipt and form, no for pages of prose and for pictures. Invoices written as
+ * running text also got yes, which only costs an OCR read, never a wrong answer. */
+private const val TABLE_QUESTION = "Does this image contain a table, receipt, price list or form with rows of values? Answer yes or no."

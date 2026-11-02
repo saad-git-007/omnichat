@@ -15,11 +15,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * MiniCPM-OCR 1.0: writes down the text in a picture (a scanned PDF page, a photo of a sign or a receipt) so the chat
- * model, which can't read small print itself, gets it as text. Loaded only while reading and freed a minute later.
+ * Xiaomi-OCR-0: writes down the text in a picture (a scanned PDF page, a photo of a sign or a receipt) so the chat
+ * model, which can't read small print itself, gets it as text, with tables as Markdown tables. Loaded only while
+ * reading and freed a minute later.
  *
- * Its image tower is the slow part, so it runs on the Adreno GPU (the NPU's memory is taken by the chat model). If
- * the GPU ever takes the app down mid-read, that is remembered and the CPU is used from then on.
+ * Its image tower runs on the CPU. On the Adreno GPU, OpenCL has no flash attention, so a page's attention needs one
+ * ~3 GB block (8k image patches squared, 12 heads) where the driver allows 1 GB: the allocation fails and llama.cpp
+ * then crashes on the missing buffer. With flash attention on the CPU the same page needs a few MB for it.
  */
 /** One thread for the process: the OCR model is a native global (see [OmniEngine]'s thread). */
 private val ocrThread = Executors.newSingleThreadExecutor { r -> Thread(r, "ocr") }.asCoroutineDispatcher()
@@ -27,80 +29,57 @@ private val ocrThread = Executors.newSingleThreadExecutor { r -> Thread(r, "ocr"
 class Ocr(context: Context, private val store: ModelStore) {
   private val thread = ocrThread
   private val scope = CoroutineScope(SupervisorJob() + thread)
-  private val prefs = context.getSharedPreferences("ocr", Context.MODE_PRIVATE)
   private var loaded = false
   private var idle: Job? = null
 
-  /** Where the image tower runs once loaded ("GPUOpenCL" or "CPU"), for the logs. */
+  /** Where the image tower runs once loaded, for the logs. */
   @Volatile var device: String? = null
     private set
 
   init {
-    // still set from last time: the app died during a GPU read (a crash, not Android freeing memory)
-    if (prefs.getBoolean(KEY_TRYING, false)) {
-      val crashed = com.saad.omnichat.CrashReports.lastExitWasCrash(context)
-      prefs.edit().putBoolean(KEY_TRYING, false).putBoolean(KEY_GPU_BROKEN, crashed).commit()
-      if (crashed) AppLog.w("OCR: the GPU stopped the app last time; reading on the CPU from now on")
+    // the model used before (1.15 GB)
+    Models.OLD_OCR.map { java.io.File(store.dir, it) }.filter { it.exists() }.forEach {
+      AppLog.i("OCR: deleting ${it.name} (replaced by Xiaomi-OCR-0)")
+      it.delete()
     }
   }
 
-  /** The image tower as used: a Q8_0 copy made once from the bf16 download (which is then deleted). */
-  private val tower = java.io.File(store.dir, "mmproj-MiniCPM-OCR-1_0-Q8_0.gguf")
+  private val tower get() = store.file(Models.OCR_VISION)
 
-  val ready: Boolean get() = store.isReady(Models.OCR) && (tower.exists() || store.isReady(Models.OCR_VISION))
-
-  /** True once the downloaded image tower has been converted (so it needn't be downloaded again). */
-  val converted: Boolean get() = tower.exists()
+  val ready: Boolean get() = store.isReady(Models.OCR) && store.isReady(Models.OCR_VISION)
 
   /** The text in [bmp], or null when the model isn't downloaded or reading failed. Blank means no text was found. */
-  suspend fun read(bmp: Bitmap, prompt: String = "Text Recognition:", onStatus: (String) -> Unit = {}): String? =
+  suspend fun read(bmp: Bitmap, onStatus: (String) -> Unit = {}): String? =
     withContext(thread) {
       if (!ready) return@withContext null
       // armed here, so Stop pressed while the model loads still stops the read that follows
       LlamaNative.nativeOcrStop(false)
       idle?.cancel()
-      if (!tower.exists()) {
-        onStatus("Preparing the OCR model (once, about a minute)")
-        val t0 = System.currentTimeMillis()
-        val part = java.io.File(tower.path + ".part")
-        if (!LlamaNative.nativeMmprojToQ8(store.file(Models.OCR_VISION).path, part.path) || !part.renameTo(tower)) {
-          AppLog.e("OCR: converting the image tower failed")
-          return@withContext null
-        }
-        store.file(Models.OCR_VISION).delete()
-        AppLog.i("OCR: image tower converted to Q8_0 in ${System.currentTimeMillis() - t0} ms (${tower.length() shr 20} MB)")
-      }
       if (!loaded) {
-        val gpu = !prefs.getBoolean(KEY_GPU_BROKEN, false)
+        onStatus("Loading the OCR model")
         val t0 = System.currentTimeMillis()
-        device = LlamaNative.nativeOcrLoad(store.file(Models.OCR).path, tower.path, if (gpu) "GPUOpenCL" else "", 4)
-          ?: if (gpu) LlamaNative.nativeOcrLoad(store.file(Models.OCR).path, tower.path, "", 4) else null
+        device = LlamaNative.nativeOcrLoad(store.file(Models.OCR).path, tower.path, "", 4)
         loaded = device != null
         AppLog.i("OCR ${if (loaded) "loaded (image tower on $device)" else "failed to load"} in ${System.currentTimeMillis() - t0} ms")
         if (!loaded) return@withContext null
       }
       val (rgb, w, h) = rgb(bmp)
-      val onGpu = device != "CPU"
-      if (onGpu) prefs.edit().putBoolean(KEY_TRYING, true).commit()
-      val text = try {
-        LlamaNative.nativeOcrRead(rgb, w, h, prompt)
-      } finally {
-        if (onGpu) prefs.edit().putBoolean(KEY_TRYING, false).commit()
-      }
+      val text = LlamaNative.nativeOcrRead(rgb, w, h, PROMPT)
       idle = scope.launch {
         delay(IDLE_UNLOAD_MS)
         LlamaNative.nativeOcrUnload()
         loaded = false
         AppLog.i("OCR unloaded")
       }
-      text?.replace(Regex("<think>\\s*</think>"), "")?.trim()
+      text?.let(OcrText::tidy)
     }
 
   fun stop() = LlamaNative.nativeOcrStop(true)
 
   private fun rgb(src: Bitmap): Triple<ByteArray, Int, Int> {
-    // the model slices big pictures itself; past ~2.5k px a side only memory grows
-    val scale = minOf(1f, MAX_SIDE.toFloat() / maxOf(src.width, src.height))
+    // each 32 px square is one token to read, and reading time grows faster than the token count; at 1.2M pixels
+    // (~1,200 tokens) a page of 8-pt print still reads with 0.3% wrong characters, at half the time of 2.1M
+    val scale = minOf(1f, MAX_SIDE.toFloat() / maxOf(src.width, src.height), kotlin.math.sqrt(MAX_PIXELS / (src.width.toFloat() * src.height)))
     val bmp = if (scale < 1f) Bitmap.createScaledBitmap(src, (src.width * scale).toInt(), (src.height * scale).toInt(), true) else src
     val c = if (bmp.config == Bitmap.Config.ARGB_8888) bmp else bmp.copy(Bitmap.Config.ARGB_8888, false)
     val px = IntArray(c.width * c.height)
@@ -116,9 +95,17 @@ class Ocr(context: Context, private val store: ModelStore) {
   }
 
   companion object {
-    private const val KEY_TRYING = "gpuReading"
-    private const val KEY_GPU_BROKEN = "gpuBroken"
     private const val IDLE_UNLOAD_MS = 60_000L
     private const val MAX_SIDE = 1800
+    private const val MAX_PIXELS = 1_200_000f
+
+    /**
+     * The model's own whole-page prompt: Markdown in reading order, tables in OTSL (made Markdown by [OcrText]). It
+     * keeps empty table cells empty; the plain-text prompt lost which column a value was in.
+     */
+    private const val PROMPT =
+      "Extract all information from the main body of the document image and represent it in markdown format, ignoring " +
+        "headers and footers. Tables should be expressed in OTSL format, formulas in the document should be represented " +
+        "using LATEX format, and the parsing should be organized according to the reading order."
   }
 }

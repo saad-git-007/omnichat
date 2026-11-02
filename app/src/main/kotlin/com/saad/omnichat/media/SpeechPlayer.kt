@@ -35,13 +35,19 @@ class SpeechPlayer(private val scope: CoroutineScope) {
     queue.close()
   }
 
-  /** Stops at once (the user interrupted). */
+  /**
+   * Stops at once (the user interrupted). The track is only paused here, which also wakes a blocked write; the writer
+   * releases it as it ends, so it is never released under the writer's feet.
+   */
   fun stop() {
     queue.close()
-    writer?.cancel()
-    track?.runCatching { pause(); flush(); stop(); release() }
+    val t = track
+    val w = writer
     track = null
     level = 0f
+    w?.cancel()
+    t?.runCatching { pause(); flush() }
+    if (w == null || w.isCompleted) t?.runCatching { release() }
   }
 
   val isPlaying: Boolean get() = writer?.isActive == true
@@ -61,6 +67,19 @@ class SpeechPlayer(private val scope: CoroutineScope) {
     val q = queue
     writer =
       scope.launch(Dispatchers.IO) {
+        try {
+          playOut(t, q, sampleRate)
+        } catch (e: IllegalStateException) {
+          // stopped while playing: nothing left to do
+        } finally {
+          level = 0f
+          t.runCatching { stop(); release() }
+          if (track === t) track = null
+        }
+      }
+  }
+
+  private suspend fun kotlinx.coroutines.CoroutineScope.playOut(t: AudioTrack, q: Channel<FloatArray>, sampleRate: Int) {
         // Speech is generated about as fast as it plays, so playback waits for a lead first. If it catches up with
         // the generator anyway, it pauses cleanly and waits for twice the lead (up to 4 s) instead of stuttering.
         var lead = sampleRate * 8 / 10
@@ -114,9 +133,5 @@ class SpeechPlayer(private val scope: CoroutineScope) {
         }
         // let the buffered tail play out
         while (playing && ahead() > 0 && isActive) kotlinx.coroutines.delay(50)
-        level = 0f
-        t.runCatching { stop(); release() }
-        if (track === t) track = null
-      }
   }
 }

@@ -26,13 +26,17 @@ data class Found(val source: String, val key: Int, val text: String, val score: 
  */
 class SemanticIndex(context: Context, private val embedder: Embedder) {
   private val dir = File(context.filesDir, "index").apply { mkdirs() }
-  private val cache = HashMap<String, List<Passage>>()
+  // every chat's index stays loaded (each search reads them all); only the last few documents' do
+  private val cache = LinkedHashMap<String, List<Passage>>(64, 0.75f, true)
   private val lock = Mutex()
+  // one indexing pass at a time: two overlapping passes over a chat read the same snapshot, and the one that finished
+  // last saved over the other's turns
+  private val indexing = Mutex()
 
   // ---- chats ----
 
   /** Adds the turns of [chat] not indexed yet: each user message with the reply to it. */
-  suspend fun indexChat(chat: SavedChat) {
+  suspend fun indexChat(chat: SavedChat) = indexing.withLock {
     val name = "chat-${chat.id}"
     val have = load(name)
     val known = have.mapTo(HashSet()) { it.key }
@@ -57,15 +61,26 @@ class SemanticIndex(context: Context, private val embedder: Embedder) {
   /** The best-matching turns across saved chats, best first; [source] is the chat id. */
   suspend fun searchChats(query: String, exclude: Long?, k: Int = 4): List<Found> {
     val q = embedder.query(query) ?: return emptyList()
-    return indexedChats().filter { it != exclude }.flatMap { id ->
-      load("chat-$id").map { Found(id.toString(), it.key, it.text, Embedder.cosine(q, it.vector)) }
-    }.sortedByDescending { it.score }.take(k).filter { it.score >= MIN_SCORE }
+    val chats = indexedChats().filter { it != exclude }.map { it to load("chat-$it") }
+    return withContext(Dispatchers.Default) {
+      chats.flatMap { (id, passages) -> passages.map { Found(id.toString(), it.key, it.text, Embedder.cosine(q, it.vector)) } }
+        .sortedByDescending { it.score }.take(k).filter { it.score >= MIN_SCORE }
+    }
   }
 
   // ---- documents ----
 
-  fun documentKey(name: String, text: String): String =
-    MessageDigest.getInstance("SHA-1").digest((name + text.length + text.take(4000)).toByteArray()).joinToString("") { "%02x".format(it) }.take(20)
+  /**
+   * The whole text is hashed: two versions of a file with the same length and opening once shared an index, so a
+   * search of the new one returned passages of the old. [DOC_KEY_VERSION] keeps new keys apart from those; files
+   * under old keys stay, as saved chats point to them.
+   */
+  fun documentKey(name: String, text: String): String {
+    val md = MessageDigest.getInstance("SHA-1")
+    md.update("$DOC_KEY_VERSION\u0000$name\u0000".toByteArray())
+    md.update(text.toByteArray())
+    return md.digest().joinToString("") { "%02x".format(it) }.take(20)
+  }
 
   fun hasDocument(key: String) = File(dir, "doc-$key.idx").exists()
 
@@ -86,8 +101,15 @@ class SemanticIndex(context: Context, private val embedder: Embedder) {
   /** The passages of a document that best answer [query], in reading order. */
   suspend fun searchDocument(key: String, query: String, k: Int = 6): List<Found> {
     val q = embedder.query(query) ?: return emptyList()
-    return load("doc-$key").map { Found(key, it.key, it.text, Embedder.cosine(q, it.vector)) }
-      .sortedByDescending { it.score }.take(k).sortedBy { it.key }
+    return searchDocument(key, q, k)
+  }
+
+  /** The same with the question already embedded, for searching several documents with one embedding. */
+  suspend fun searchDocument(key: String, query: FloatArray, k: Int = 6): List<Found> {
+    val passages = load("doc-$key")
+    return withContext(Dispatchers.Default) {
+      passages.map { Found(key, it.key, it.text, Embedder.cosine(query, it.vector)) }.sortedByDescending { it.score }.take(k).sortedBy { it.key }
+    }
   }
 
   // ---- storage ----
@@ -111,12 +133,19 @@ class SemanticIndex(context: Context, private val embedder: Embedder) {
           }
         }.onFailure { AppLog.w("index $name unreadable: ${it.message}") }.getOrDefault(emptyList())
       }
-    cache[name] = list
+    remember(name, list)
     list
   }
 
-  private suspend fun save(name: String, list: List<Passage>) = lock.withLock {
+  /** Caches [list]; documents beyond the last [DOC_CACHE] used are dropped (they are read again when needed). */
+  private fun remember(name: String, list: List<Passage>) {
     cache[name] = list
+    val docs = cache.keys.filter { it.startsWith("doc-") } // least recently used first
+    docs.take(maxOf(0, docs.size - DOC_CACHE)).forEach(cache::remove)
+  }
+
+  private suspend fun save(name: String, list: List<Passage>) = lock.withLock {
+    remember(name, list)
     withContext(Dispatchers.IO) {
       val tmp = File(dir, "$name.idx.part")
       DataOutputStream(tmp.outputStream().buffered()).use { out ->
@@ -135,6 +164,8 @@ class SemanticIndex(context: Context, private val embedder: Embedder) {
 
   companion object {
     private const val MAGIC = 0x4F4D4931 // "OMI1"
+    private const val DOC_KEY_VERSION = 2
+    private const val DOC_CACHE = 4
     private const val PASSAGE_CHARS = 1600
     private const val CHUNK = 1200
     private const val OVERLAP = 200

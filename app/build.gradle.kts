@@ -12,8 +12,8 @@ android {
     applicationId = "com.saad.omnichat"
     minSdk = 33
     targetSdk = 37
-    versionCode = 28
-    versionName = "1.27"
+    versionCode = 36
+    versionName = "1.35"
 
     ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     externalNativeBuild {

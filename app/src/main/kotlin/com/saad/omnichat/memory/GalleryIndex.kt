@@ -54,7 +54,7 @@ class GalleryIndex(private val context: Context, private val embedder: Embedder)
   }
   private var loaded = false
 
-  suspend fun indexedCount(): Int = lock.withLock { ensureLoaded(); count }
+  suspend fun indexedCount(): Int = lock.withLock { load(); count }
 
   /** Everything the gallery holds now, newest first (metadata only, no pixels). */
   suspend fun listMedia(): List<GalleryItem> =
@@ -82,7 +82,7 @@ class GalleryIndex(private val context: Context, private val embedder: Embedder)
    */
   suspend fun indexAll(since: Long?, paused: () -> Boolean, onProgress: (Int, Int) -> Unit) {
     val media = listMedia().let { all -> if (since == null) all else all.filter { it.taken >= since } }
-    val have = lock.withLock { ensureLoaded(); HashSet<Long>(count * 2).apply { for (i in 0 until count) add(ids[i]) } }
+    val have = lock.withLock { load(); HashSet<Long>(count * 2).apply { for (i in 0 until count) add(ids[i]) } }
     // only a crash counts: Android closing the app in the background to free memory says nothing about the photo
     val culprit = runCatching { current.readText().trim().toLong() }.getOrNull()?.takeIf { com.saad.omnichat.CrashReports.lastExitWasCrash(context) }
     current.delete()
@@ -142,14 +142,17 @@ class GalleryIndex(private val context: Context, private val embedder: Embedder)
     val inRange = media.filterValues { (from == null || it.taken >= from) && (to == null || it.taken < to) && (video == null || it.video == video) }
     if (query.isBlank()) return inRange.values.take(limit).map { GalleryHit(it, 0f) }
     val q = embedder.query(query) ?: return emptyList()
+    // tens of thousands of photos: scored off the main thread
     val scored = lock.withLock {
-      ensureLoaded()
-      (0 until count).mapNotNull { i ->
-        val item = inRange[ids[i]] ?: return@mapNotNull null
-        val v = vectors[i].takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-        GalleryHit(item, Embedder.cosine(q, v))
+      load()
+      withContext(Dispatchers.Default) {
+        (0 until count).mapNotNull { i ->
+          val item = inRange[ids[i]] ?: return@mapNotNull null
+          val v = vectors[i].takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+          GalleryHit(item, Embedder.cosine(q, v))
+        }.sortedByDescending { it.score }
       }
-    }.sortedByDescending { it.score }
+    }
     // keep what is close to the best match: photo-to-text scores sit in a narrow band (~0.45-0.75)
     val best = scored.firstOrNull()?.score ?: return emptyList()
     return scored.filter { it.score >= best - 0.08f }.take(limit)
@@ -184,6 +187,11 @@ class GalleryIndex(private val context: Context, private val embedder: Embedder)
     } finally {
       bmp.recycle()
     }
+  }
+
+  /** [ensureLoaded] on a background thread: the first read copies up to ~90 MB of vectors. Call holding [lock]. */
+  private suspend fun load() {
+    if (!loaded) withContext(Dispatchers.IO) { ensureLoaded() }
   }
 
   private fun ensureLoaded() {

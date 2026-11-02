@@ -609,7 +609,7 @@ private fun AssistantMessage(msg: ChatMessage, animate: Boolean, vm: ChatViewMod
               when (a) {
                 Activity.SEARCHING -> if (msg.gallery.isNotEmpty() || msg.sources.isEmpty() && msg.text.isEmpty()) "Searching" else "Searching the web"
                 Activity.EMBEDDINGS -> "Searching this phone · EmbeddingGemma running"
-                Activity.OCR -> "Reading the text · MiniCPM-OCR running"
+                Activity.OCR -> "Reading the text · Xiaomi-OCR running"
                 Activity.USING_PHONE -> "Using the phone"
                 Activity.READING_IMAGE -> "Reading the image"
                 Activity.LISTENING -> "Listening to the audio"
@@ -670,7 +670,11 @@ private fun SourcesList(sources: List<com.saad.omnichat.net.Source>) {
     sources.forEach { s ->
       Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-          .clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(s.url))) }
+          .clickable {
+            // no browser able to open it (or a malformed link): say so instead of closing the app
+            runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(s.url))) }
+              .onFailure { android.widget.Toast.makeText(context, "No app here can open this link", android.widget.Toast.LENGTH_SHORT).show() }
+          }
           .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
       ) {

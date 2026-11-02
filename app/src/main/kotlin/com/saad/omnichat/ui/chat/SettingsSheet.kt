@@ -17,6 +17,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.material3.Text
 import androidx.compose.foundation.layout.Box
 import androidx.compose.material.icons.filled.ArrowDropDown
@@ -161,6 +163,27 @@ fun SettingsSheet(state: UiState, onDismiss: () -> Unit, onSave: (Settings) -> U
       }
 
       HorizontalDivider()
+      Text("Live transcribe", style = MaterialTheme.typography.titleMedium)
+      Text("Writes down every ${s.liveSeconds} seconds")
+      Text(
+        "Longer blocks give the model whole sentences to work with, so fewer words are cut or misheard; shorter ones put text on screen sooner.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      Slider(
+        value = s.liveSeconds.toFloat(),
+        onValueChange = { s = s.copy(liveSeconds = it.roundToInt()) },
+        valueRange = LIVE_SECONDS_RANGE.first.toFloat()..LIVE_SECONDS_RANGE.last.toFloat(),
+        steps = LIVE_SECONDS_RANGE.last - LIVE_SECONDS_RANGE.first - 1,
+        modifier = Modifier.semantics { contentDescription = "Live transcribe block length" },
+      )
+      ToggleRow(
+        "Meeting notes",
+        "Action items, decisions and the key points of each minute, noted between pieces while it listens, and a summary when you stop. Transcription always comes first.",
+        s.meetingNotes,
+      ) { s = s.copy(meetingNotes = it) }
+
+      HorizontalDivider()
       Text("Phone tools", style = MaterialTheme.typography.titleMedium)
       ToggleRow(
         "Let the model use the phone",
@@ -185,7 +208,8 @@ fun SettingsSheet(state: UiState, onDismiss: () -> Unit, onSave: (Settings) -> U
       ) { s = s.copy(smartSearch = it) }
       val mediaPermissions = arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES, android.Manifest.permission.READ_MEDIA_VIDEO)
       val galleryAsk = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { r ->
-        val ok = r.values.any { it } || ctx.checkSelfPermission(android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        // "selected photos only" access exists from Android 14
+        val ok = r.values.any { it } || (android.os.Build.VERSION.SDK_INT >= 34 && ctx.checkSelfPermission(android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == android.content.pm.PackageManager.PERMISSION_GRANTED)
         if (ok) s = s.copy(gallerySearch = true)
       }
       ToggleRow(
@@ -218,7 +242,7 @@ fun SettingsSheet(state: UiState, onDismiss: () -> Unit, onSave: (Settings) -> U
       Text("Read text (OCR)", style = MaterialTheme.typography.titleMedium)
       ToggleRow(
         "Read scanned PDFs and text in photos",
-        "OpenBMB's MiniCPM-OCR writes down the text in PDF pages that are only pictures, and in photos you attach (signs, receipts, screenshots), so the chat model can work with it. Runs on this phone, loaded only while reading. Downloads 1.4 GB once. About 10 to 40 seconds a page.",
+        "Xiaomi-OCR-0 writes down the text in PDF pages that are only pictures, pictures inside PDFs, and photos you attach (signs, receipts, screenshots), tables included, so the chat model can work with it. Runs on this phone, loaded only while reading. Downloads 0.75 GB once.",
         s.ocr,
       ) { s = s.copy(ocr = it) }
       state.ocrStatus?.let {

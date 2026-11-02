@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -23,7 +24,6 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "sampling.h"
-#include "mmproj_q8.h"
 
 #define TAG "omni"
 #define LOGI(...) omni_logf(ANDROID_LOG_INFO,  __VA_ARGS__)
@@ -169,11 +169,25 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 
 static bool abort_cb(void *) { return g_abort.load(); }
 
+// Meeting notes run in the side context between live-transcribe blocks; the next block stops them (and only them)
+static std::atomic<bool> g_notes_running{false};
+static std::atomic<bool> g_notes_abort{false};
+static bool side_abort_cb(void *) { return g_abort.load() || (g_notes_running.load() && g_notes_abort.load()); }
+
 // Last backend exception, e.g. a GPU driver failing to compile a kernel. Read by nativeLastError().
 static std::string g_last_error;
+static std::mutex  g_last_error_mutex; // the OCR and embedder threads write it, the engine thread reads it
+
+static std::string last_error() {
+    std::lock_guard<std::mutex> lock(g_last_error_mutex);
+    return g_last_error;
+}
 
 static void backend_failed(const char * where, const std::exception & e) {
-    g_last_error = e.what();
+    {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        g_last_error = e.what();
+    }
     LOGE("%s: backend exception: %s", where, e.what());
 }
 
@@ -217,9 +231,18 @@ static std::string format_turn(const common_chat_msg & new_msg, bool add_generat
     inputs.add_generation_prompt = add_generation_prompt;
     const std::string full = common_chat_templates_apply(g_tmpls.get(), inputs).prompt.str();
 
+    // the earlier turns must render the same with this one added, or the KV cache doesn't match what follows
+    if (full.size() < past.size() || full.compare(0, past.size(), past) != 0)
+        throw std::runtime_error("the chat template rendered the earlier turns differently");
     // the reply was cut at <|im_end|>, so the newline after it is not in the KV cache yet
     std::string out = (!past.empty() && past.back() == '\n') ? "\n" : "";
     return out + full.substr(past.size());
+}
+
+// [s] as a Java string, without a character the token limit cut in half (invalid UTF-8 aborts under CheckJNI)
+static jstring whole_utf8(JNIEnv * env, std::string s) {
+    for (int i = 0; i < 3 && utf8_incomplete(s); i++) s.pop_back();
+    return env->NewStringUTF(s.c_str());
 }
 
 // text-only output: never let the model switch to its audio or interleaved modes
@@ -380,7 +403,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeLoad(JNIEnv * env, jobject, jstring
     } catch (const std::exception & e) {
         backend_failed("model load", e); // e.g. the Hexagon NPU refusing a FastRPC session
     }
-    if (!g_model) return env->NewStringUTF(("failed to load model " + g_last_error).c_str());
+    if (!g_model) return env->NewStringUTF(("failed to load model " + last_error()).c_str());
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = n_ctx;
@@ -420,7 +443,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeLoad(JNIEnv * env, jobject, jstring
     } catch (const std::exception & e) {
         backend_failed("init", e);
     }
-    if (!g_ctx) { free_all(); return env->NewStringUTF(("failed to create context " + g_last_error).c_str()); }
+    if (!g_ctx) { free_all(); return env->NewStringUTF(("failed to create context " + last_error()).c_str()); }
     llama_set_abort_callback(g_ctx, abort_cb, nullptr);
 
     try {
@@ -556,7 +579,15 @@ Java_com_saad_omnichat_llm_LlamaNative_nativePrompt(JNIEnv * env, jobject, jstri
     msg.role    = jstr(env, jrole); // "user", or "tool" for a tool result
     msg.content = content;
     const bool add_bos = g_n_past == 0;
-    std::string prompt = format_turn(msg);
+    std::string prompt;
+    try {
+        prompt = format_turn(msg);
+    } catch (const std::exception & e) {
+        // a C++ exception must not cross into Java (that aborts the app): fail the prompt, the app rebuilds the chat
+        LOGE("prompt formatting failed: %s", e.what());
+        res[0] = 2;
+        return ret();
+    }
 
     // the jinja template may already render the BOS text; do not add a second one
     const llama_vocab * vocab = llama_model_get_vocab(g_model);
@@ -775,6 +806,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeVoicePrompt(JNIEnv * env, jobject, 
         g_voice_tok = common_sampler_sample(g_smpl, g_ctx, -1);
         common_sampler_accept(g_smpl, g_voice_tok, true);
         const float * h = llama_get_embeddings_ith(g_ctx, -1);
+        if (!h) { res[0] = 2; return ret(); } // no hidden state for the last token: nothing to speak from
         g_voice_h.assign(h, h + llama_model_n_embd(g_model));
         g_voice_text.clear();
         g_voice_pcm.clear();
@@ -916,17 +948,19 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeQuantizeHead(JNIEnv * env, jobject,
     } catch (const std::exception & e) {
         backend_failed("quantize", e);
     }
-    if (rc != 0) return env->NewStringUTF(("quantize failed " + g_last_error).c_str());
+    if (rc != 0) return env->NewStringUTF(("quantize failed " + last_error()).c_str());
     return nullptr;
 }
 
 // Returns and clears the last backend exception message, or null.
 JNIEXPORT jstring JNICALL
 Java_com_saad_omnichat_llm_LlamaNative_nativeLastError(JNIEnv * env, jobject) {
-    if (g_last_error.empty()) return nullptr;
-    jstring out = env->NewStringUTF(g_last_error.c_str());
-    g_last_error.clear();
-    return out;
+    std::string e;
+    {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        e.swap(g_last_error);
+    }
+    return e.empty() ? nullptr : env->NewStringUTF(e.c_str());
 }
 
 JNIEXPORT void JNICALL
@@ -944,6 +978,13 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeCtxSize(JNIEnv *, jobject) {
     return g_ctx ? (jint) llama_n_ctx(g_ctx) : 0;
 }
 
+// How many tokens the chat model reads [text] as; -1 when no model is loaded.
+JNIEXPORT jint JNICALL
+Java_com_saad_omnichat_llm_LlamaNative_nativeTokenCount(JNIEnv * env, jobject, jstring jtext) {
+    if (!g_model) return -1;
+    return (jint) common_tokenize(llama_model_get_vocab(g_model), jstr(env, jtext), false, true).size();
+}
+
 
 // The small second context that speech and dictation use, so the chat's own cache is never touched.
 static bool side_ctx() {
@@ -958,7 +999,7 @@ static bool side_ctx() {
     cp.swa_full        = false;
     g_tts_ctx = llama_init_from_model(g_model, cp);
     if (!g_tts_ctx) return false;
-    llama_set_abort_callback(g_tts_ctx, abort_cb, nullptr);
+    llama_set_abort_callback(g_tts_ctx, side_abort_cb, nullptr);
     LOGI("side context ready");
     return true;
 }
@@ -1020,9 +1061,123 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeTranscribe(JNIEnv * env, jobject, j
         }
         common_sampler_free(smpl);
         LOGI("dictation: %d samples -> %zu chars", (int) n, out.size());
-        return env->NewStringUTF(out.c_str());
+        return whole_utf8(env, out);
     } catch (const std::exception & e) {
         backend_failed("dictation", e);
+        return nullptr;
+    }
+}
+
+// Meeting notes: a short text-only answer in the side context (the chat is untouched). Stops early, returning null,
+// when nativeNotesAbort(true) is called: the next live-transcribe block comes first. Null on failure too.
+JNIEXPORT jstring JNICALL
+Java_com_saad_omnichat_llm_LlamaNative_nativeNotesAsk(JNIEnv * env, jobject, jstring jsystem, jstring juser, jint max_tokens) {
+    if (!g_model || g_notes_abort) return nullptr;
+    g_abort = false;
+    struct Running { Running() { g_notes_running = true; } ~Running() { g_notes_running = false; } } running;
+    try {
+        if (!side_ctx()) return nullptr;
+        llama_set_embeddings(g_tts_ctx, false);
+        llama_memory_clear(llama_get_memory(g_tts_ctx), true);
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja             = true;
+        inputs.enable_thinking       = false;
+        inputs.add_generation_prompt = true;
+        common_chat_msg sys;
+        sys.role    = "system";
+        sys.content = jstr(env, jsystem);
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = jstr(env, juser);
+        inputs.messages = { sys, user };
+        const std::string prompt = common_chat_templates_apply(g_tmpls.get(), inputs).prompt.str();
+        auto toks = common_tokenize(llama_model_get_vocab(g_model), prompt, false, true);
+        if ((int) toks.size() + max_tokens >= (int) llama_n_ctx(g_tts_ctx)) return nullptr;
+        for (size_t i = 0; i < toks.size(); i += N_BATCH) {
+            llama_batch b = llama_batch_get_one(toks.data() + i, (int) std::min<size_t>(N_BATCH, toks.size() - i));
+            if (llama_decode(g_tts_ctx, b) != 0) return nullptr;
+        }
+        llama_pos n_past = (llama_pos) toks.size();
+        common_params_sampling sp;
+        sp.temp       = 0;
+        sp.logit_bias = text_only_bias();
+        common_sampler * smpl = common_sampler_init(g_model, sp);
+        const llama_vocab * vocab = llama_model_get_vocab(g_model);
+        std::string out;
+        bool stopped = false;
+        for (int i = 0; i < max_tokens && n_past + 1 < (llama_pos) llama_n_ctx(g_tts_ctx); i++) {
+            if (g_notes_abort) { stopped = true; break; }
+            llama_token t = common_sampler_sample(smpl, g_tts_ctx, -1);
+            common_sampler_accept(smpl, t, true);
+            if (llama_vocab_is_eog(vocab, t)) break;
+            out += common_token_to_piece(g_tts_ctx, t, false);
+            llama_batch b = llama_batch_get_one(&t, 1);
+            if (llama_decode(g_tts_ctx, b) != 0) { stopped = true; break; }
+            n_past++;
+        }
+        common_sampler_free(smpl);
+        if (stopped) return nullptr;
+        return whole_utf8(env, out);
+    } catch (const std::exception & e) {
+        backend_failed("meeting notes", e);
+        return nullptr;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_saad_omnichat_llm_LlamaNative_nativeNotesAbort(JNIEnv *, jobject, jboolean stop) { g_notes_abort = stop; }
+
+// A short answer about a picture (RGB bytes), in the side context so the chat is untouched: the photo check that
+// decides whether a photo needs the OCR model. At most [max_tokens]; null on failure.
+JNIEXPORT jstring JNICALL
+Java_com_saad_omnichat_llm_LlamaNative_nativeImageQuestion(JNIEnv * env, jobject, jbyteArray rgb, jint w, jint h, jstring jquestion, jint max_tokens) {
+    if (!g_model || !g_mtmd || env->GetArrayLength(rgb) != w * h * 3) return nullptr;
+    g_abort = false;
+    try {
+        if (!side_ctx()) return nullptr;
+        llama_set_embeddings(g_tts_ctx, false);
+        llama_memory_clear(llama_get_memory(g_tts_ctx), true);
+        jbyte * data = env->GetByteArrayElements(rgb, nullptr);
+        mtmd::bitmap image(mtmd_bitmap_init(w, h, reinterpret_cast<const unsigned char *>(data)));
+        env->ReleaseByteArrayElements(rgb, data, JNI_ABORT);
+        if (!image.ptr) return nullptr;
+
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja             = true;
+        inputs.enable_thinking       = false;
+        inputs.add_generation_prompt = true;
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = std::string(mtmd_default_marker()) + "\n" + jstr(env, jquestion);
+        inputs.messages = { user };
+        const std::string prompt = common_chat_templates_apply(g_tmpls.get(), inputs).prompt.str();
+
+        mtmd_input_text text = { prompt.c_str(), prompt.size(), false, true };
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        const mtmd_bitmap * bms[] = { image.ptr.get() };
+        if (mtmd_tokenize(g_mtmd.get(), chunks.ptr.get(), &text, bms, 1) != 0) return nullptr;
+        llama_pos n_past = 0;
+        if (mtmd_helper_eval_chunks(g_mtmd.get(), g_tts_ctx, chunks.ptr.get(), 0, 0, N_BATCH, true, &n_past) != 0) return nullptr;
+
+        common_params_sampling sp;
+        sp.temp       = 0;
+        sp.logit_bias = text_only_bias();
+        common_sampler * smpl = common_sampler_init(g_model, sp);
+        const llama_vocab * vocab = llama_model_get_vocab(g_model);
+        std::string out;
+        for (int i = 0; i < max_tokens && n_past + 1 < (llama_pos) llama_n_ctx(g_tts_ctx) && !g_abort; i++) {
+            llama_token t = common_sampler_sample(smpl, g_tts_ctx, -1);
+            common_sampler_accept(smpl, t, true);
+            if (llama_vocab_is_eog(vocab, t)) break;
+            out += common_token_to_piece(g_tts_ctx, t, false);
+            llama_batch b = llama_batch_get_one(&t, 1);
+            if (llama_decode(g_tts_ctx, b) != 0) break;
+            n_past++;
+        }
+        common_sampler_free(smpl);
+        return whole_utf8(env, out);
+    } catch (const std::exception & e) {
+        backend_failed("image question", e);
         return nullptr;
     }
 }
@@ -1071,6 +1226,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeSpeakStart(JNIEnv * env, jobject, j
         g_tts_tok = common_sampler_sample(g_tts_smpl, g_tts_ctx, -1);
         common_sampler_accept(g_tts_smpl, g_tts_tok, true);
         const float * h = llama_get_embeddings_ith(g_tts_ctx, -1);
+        if (!h) return 2;
         g_tts_h.assign(h, h + llama_model_n_embd(g_model));
         // ~12.5 frames a second; a sentence never needs more than ~40 s
         g_tts_left   = 500;
@@ -1283,7 +1439,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeEmbedImage(JNIEnv * env, jobject, j
     }
 }
 
-// ---- OCR: MiniCPM-OCR 1.0, a separate small model that writes down the text in a picture -----------------------
+// ---- OCR: Xiaomi-OCR-0, a separate small model that writes down the text in a picture --------------------------
 // Loaded only while reading. Its text part runs on the CPU (the NPU's memory is taken by the chat model); the image
 // tower runs on [enc_dev] when given (the Adreno GPU), else the CPU.
 
@@ -1317,7 +1473,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeOcrLoad(JNIEnv * env, jobject, jstr
         g_ocr_model = llama_model_load_from_file(jstr(env, jpath).c_str(), mp);
         if (!g_ocr_model) return nullptr;
         auto cp = llama_context_default_params();
-        cp.n_ctx           = 8192; // up to 10 slices of 256 image tokens, plus a page of text
+        cp.n_ctx           = 8192; // a 1800 px page is ~3k image tokens (one per 32 px square), plus its text
         cp.n_batch         = 512;
         cp.n_ubatch        = 512;
         cp.n_threads       = threads;
@@ -1335,7 +1491,8 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeOcrLoad(JNIEnv * env, jobject, jstr
         vp.n_threads       = threads;
         vp.print_timings   = true;
         vp.warmup          = false;
-        vp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        // without it a page's attention is one ~3 GB block (see Ocr.kt); the CPU always has it
+        vp.flash_attn_type = enc_dev ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_ENABLED;
         g_ocr_mtmd = mtmd_init_from_file(jstr(env, jmmproj).c_str(), g_ocr_model, vp);
         if (!g_ocr_mtmd) { ocr_free(); return nullptr; }
         const char * where = enc_dev ? ggml_backend_dev_name(enc_dev) : "CPU";
@@ -1351,17 +1508,10 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeOcrLoad(JNIEnv * env, jobject, jstr
 JNIEXPORT void JNICALL
 Java_com_saad_omnichat_llm_LlamaNative_nativeOcrUnload(JNIEnv *, jobject) { ocr_free(); }
 
-// One-time: the downloaded image tower is bf16, which the phone's backends run slowly; write a Q8_0 copy.
-JNIEXPORT jboolean JNICALL
-Java_com_saad_omnichat_llm_LlamaNative_nativeMmprojToQ8(JNIEnv * env, jobject, jstring jsrc, jstring jdst) {
-    return mmproj_to_q8(jstr(env, jsrc), jstr(env, jdst)) ? JNI_TRUE : JNI_FALSE;
-}
-
 JNIEXPORT void JNICALL
 Java_com_saad_omnichat_llm_LlamaNative_nativeOcrStop(JNIEnv *, jobject, jboolean stop) { g_ocr_abort = stop; }
 
-// The text in a picture (RGB bytes) as the model writes it down, or null on failure. [prompt] is the task,
-// "Text Recognition:" for pages and photos.
+// The text in a picture (RGB bytes) as the model writes it down, or null on failure. [prompt] is the task.
 JNIEXPORT jstring JNICALL
 Java_com_saad_omnichat_llm_LlamaNative_nativeOcrRead(JNIEnv * env, jobject, jbyteArray rgb, jint w, jint h, jstring jprompt) {
     if (!g_ocr_ctx || !g_ocr_mtmd || g_ocr_abort) return nullptr;
@@ -1417,7 +1567,7 @@ Java_com_saad_omnichat_llm_LlamaNative_nativeOcrRead(JNIEnv * env, jobject, jbyt
         }
         common_sampler_free(smpl);
         LOGI("OCR: %dx%d, read in %lld ms, wrote %d tokens in %lld ms", (int) w, (int) h, (long long) (t1 - t0), n_gen, (long long) (ggml_time_ms() - t1));
-        return env->NewStringUTF(out.c_str());
+        return whole_utf8(env, out);
     } catch (const std::exception & e) {
         backend_failed("OCR", e);
         return nullptr;

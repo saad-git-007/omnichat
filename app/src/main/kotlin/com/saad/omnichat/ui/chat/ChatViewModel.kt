@@ -31,7 +31,9 @@ import com.saad.omnichat.media.SpeechPlayer
 import com.saad.omnichat.llm.GenEvent
 import com.saad.omnichat.llm.Media
 import com.saad.omnichat.llm.OmniEngine
+import com.saad.omnichat.live.MeetingNotes
 import com.saad.omnichat.media.DocumentReader
+import com.saad.omnichat.media.TableHints
 import com.saad.omnichat.media.AudioStream
 import com.saad.omnichat.net.Source
 import com.saad.omnichat.net.WebSearch
@@ -44,6 +46,7 @@ import com.saad.omnichat.stats.ProcMem
 import com.saad.omnichat.stats.RunRecord
 import com.saad.omnichat.stats.StatsStore
 import java.util.concurrent.atomic.AtomicLong
+import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -52,6 +55,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 enum class AttachmentKind { IMAGE, AUDIO, DOCUMENT }
@@ -109,6 +113,10 @@ data class Settings(
   // voice chat: the language and voice the model speaks in (codes from its "tts" template)
   val voiceLang: String = "en",
   val voiceGender: String = "female",
+  // live transcribe writes down this many seconds at a time: longer blocks read whole sentences, shorter ones show sooner
+  val liveSeconds: Int = LIVE_SECONDS_DEFAULT,
+  // ...and meanwhile notes action items, decisions and key points, between pieces (see MeetingNotes)
+  val meetingNotes: Boolean = true,
   // the model may use the phone: alarms, calendar, messages, maps, calculator... (each opens the app to confirm)
   val phoneTools: Boolean = true,
   // EmbeddingGemma 2: search past chats and long documents by meaning (downloads 310 MB once)
@@ -117,7 +125,7 @@ data class Settings(
   val gallerySearch: Boolean = false,
   // only photos and videos from the last this many months are indexed (0 = all)
   val galleryMonths: Int = 0,
-  // MiniCPM-OCR: reads the text in scanned PDF pages and photos (downloads 1.4 GB once)
+  // Xiaomi-OCR-0: reads the text in scanned PDF pages and photos (downloads 0.75 GB once)
   val ocr: Boolean = false,
   val systemPrompt: String = "You are a helpful assistant.",
 )
@@ -135,27 +143,6 @@ enum class VoicePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
 /** Voice chat screen state; its turns are also added to the chat. */
 data class VoiceUi(val phase: VoicePhase = VoicePhase.IDLE, val reply: String = "", val photo: Attachment? = null, val live: LiveTranscript? = null)
-
-/** One stretch of live transcription; [at] is milliseconds from the start. */
-data class LiveLine(val at: Long, val text: String)
-
-/** Live transcribe in voice chat: the mic stays open and what is said is written down a few seconds at a time. */
-data class LiveTranscript(val started: Long, val lines: List<LiveLine> = emptyList(), val running: Boolean = true, val writing: Boolean = false) {
-  /** With [stamps], a line per piece starting with its time; without, the pieces run together as plain text. */
-  fun text(stamps: Boolean): String =
-    if (stamps) lines.joinToString("\n") { "[${stamp(it.at)}] ${it.text}" } else lines.joinToString(" ") { it.text.trim() }
-
-  fun export(stamps: Boolean): String =
-    if (!stamps) text(false) + "\n"
-    else "Live transcript, ${java.text.SimpleDateFormat("EEE d MMM yyyy, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(started))}\n\n${text(true)}\n"
-
-  companion object {
-    fun stamp(ms: Long): String {
-      val s = ms / 1000
-      return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%02d:%02d".format(s / 60, s % 60)
-    }
-  }
-}
 
 /** A saved custom instruction, applied to the system prompt of every new chat while enabled. */
 data class Instruction(val id: Long, val text: String, val enabled: Boolean = true)
@@ -201,7 +188,10 @@ private const val MAX_AUDIO_SECONDS = 600
 /** Longer recordings are transcribed in pieces of this length (~3.75k audio tokens each). */
 private const val SEGMENT_SECONDS = 60 // one encoder pass each; see OmniEngine.attach
 private const val NEARBY_MS = 6 * 3_600_000L // "around the same time" for gallery results
-private const val LIVE_CHUNK_SECONDS = 5 // live transcribe writes down this much at a time, or more when the phone lags
+// live transcribe writes down this much at a time (Settings), or more when the phone lags. 30 s is ~400 audio tokens,
+// well inside the 2k side context it is transcribed in
+const val LIVE_SECONDS_DEFAULT = 5
+val LIVE_SECONDS_RANGE = 3..30
 private const val STAMP_EVERY_SECONDS = 300
 
 private const val MAX_TOOL_CALLS = 4
@@ -210,6 +200,24 @@ private const val MIC_BUSY = "The microphone couldn't be opened. Another app (or
 
 /** Largest context that fits the Hexagon NPU's ~3.1 GB address space next to the model and its encoders. */
 const val NPU_MAX_CTX = 32768
+
+/** Asking for the words themselves ("read it out", "transcribe this", "extract the text"): the OCR model reads exactly. */
+private val WANTS_EXACT_TEXT = Regex("""\b(read (it|this|out|all|the text|everything)|transcribe|extract|copy (the|all|out)|word for word|exact (text|words|wording)|all the text|what does (it|this) say|type (it|this) out)""", RegexOption.IGNORE_CASE)
+
+/** The photo check reads a copy this size: enough to see rows and columns, ~250 tokens. */
+private const val PHOTO_CHECK_SIDE = 512
+
+/** While a reply streams, the screen gets its text at most this often (ms). */
+private const val TEXT_FRAME_MS = 60L
+
+/** Meeting summaries take this many key points at a time (~600 tokens, well inside the 2k side context). */
+private const val SUMMARY_GROUP = 30
+
+/** Tokens of the context kept free of documents: the system turn (~1,300 with tools), the question and the answer. */
+private const val CHAT_RESERVE_TOKENS = 4096
+
+/** The table facts put next to a question are left out when fewer tokens than this would be left for the answer. */
+private const val ANSWER_ROOM_TOKENS = 1024
 
 /** A long document is searched by meaning up to this size; its opening goes into the prompt as-is. */
 private const val MAX_INDEXED_CHARS = 4_000_000
@@ -277,8 +285,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
   init {
     if (store.allReady()) loadModel() else _state.update { it.copy(phase = Phase.NeedsDownload) }
-    viewModelScope.launch { _state.update { it.copy(runs = statsStore.load()) } }
+    viewModelScope.launch { runCatching { statsStore.load() }.onSuccess { r -> _state.update { it.copy(runs = r) } }.onFailure { AppLog.e("reading stats failed", it) } }
     viewModelScope.launch { _state.update { it.copy(chats = chatStore.list()) } }
+    restoreLive()
   }
 
   /** Reopens a saved conversation; its text goes back to the model as history with the next message. */
@@ -325,7 +334,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val earlierMedia = m.attachments.filter { it.kind != AttachmentKind.DOCUMENT && it.media is Media.Document }
     return buildString {
       docs.forEach {
-        append("<document name=\"").append(it.name).append("\">\n").append(it.text)
+        append("<document name=\"").append(it.name).append("\">\n").append(TableHints.forModel(it.name, it.text, partial = it.truncated || it.index != null))
         if (it.index != null) append("\n[… the document continues; the passages that matter for each question are given with it]")
         append("\n</document>\n\n")
       }
@@ -572,10 +581,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 DocumentReader.isDocument(type, name) -> {
                   // ~3 characters per token, leaving 4k tokens of the context for the chat, question and answer
-                  val maxChars = ((effectiveCtx() - 4096) * 3).coerceAtLeast(4000)
+                  val maxChars = ((effectiveCtx() - CHAT_RESERVE_TOKENS) * 3).coerceAtLeast(4000)
                   val reader: com.saad.omnichat.media.PageReader? =
                     if (_state.value.settings.ocr && ocr.ready) { bmp, what ->
-                      _state.update { it.copy(busyMessage = "MiniCPM-OCR running: reading $what in $name") }
+                      _state.update { it.copy(busyMessage = "Xiaomi-OCR running: reading $what in $name") }
                       ocr.read(bmp) { msg -> _state.update { it.copy(busyMessage = msg) } }
                     } else null
                   var scans = 0
@@ -583,14 +592,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                   val full = DocumentReader.read(ctx, uri, type, name, if (embedder.loaded) MAX_INDEXED_CHARS else maxChars, reader) { s, p -> scans = s; pictures = p }
                   if (scans > 0 && reader == null) notice("$scans page(s) of $name are pictures with no text layer. Turn on Read text (OCR) in Settings to read them.")
                   else if (pictures > 0 && reader == null) notice("$name has $pictures picture(s) that may hold text the model can't see. Turn on Read text (OCR) in Settings to read them.")
+                  // counted in real tokens: digits and symbols take more per character than prose (a sheet of
+                  // numbers is ~2.6 characters a token), so a sheet within maxChars can still fill the context
+                  val budget = effectiveCtx() - CHAT_RESERVE_TOKENS
+                  val tooLong = full.text.length > maxChars || (engine.tokenCount(TableHints.forModel(name, full.text, partial = false)) ?: 0) > budget
                   val doc =
-                    if (embedder.loaded && full.text.length > maxChars) {
+                    if (embedder.loaded && tooLong) {
                       // too long for the context: keep its opening, and search the rest by meaning for each question
                       val key = semantic.documentKey(name, full.text)
                       semantic.indexDocument(key, name, full.text) { done, total -> _state.update { it.copy(busyMessage = "EmbeddingGemma running: indexing $name for search, $done of $total passages") } }
-                      Media.Document(name, full.text.take(minOf(maxChars / 2, DOC_OPENING_CHARS)), truncated = true, index = key)
+                      Media.Document(name, full.text.take(minOf(maxChars / 2, DOC_OPENING_CHARS)), truncated = true, index = key, table = wholeSheet(name, full))
+                    } else if (tooLong) {
+                      Media.Document(name, fitTokens(name, full.text.take(maxChars), budget), truncated = true, table = wholeSheet(name, full))
                     } else full
-                  if (doc.truncated && doc.index == null) notice("$name is long: only the first ${maxChars / 1000}k characters fit in the model's context. Turn on Smart search in Settings to search all of it.")
+                  if (doc.truncated && doc.index == null) notice("$name is long: only the first ${doc.text.length / 1000}k characters fit in the model's context. Turn on Smart search in Settings to search all of it.")
                   if (full.truncated && doc.index != null) notice("$name is very long: only its first ${MAX_INDEXED_CHARS / 1_000_000}M characters are searchable.")
                   Attachment(ids.incrementAndGet(), AttachmentKind.DOCUMENT, "$name · ${"%,d".format(full.text.length)} chars${if (doc.index != null) " · searchable" else ""}", uri, doc)
                 }
@@ -696,6 +711,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val app = getApplication<Application>()
     GenerationService.start(app, "Reading your message…")
     var lastNotify = 0L
+    var lastShown = 0L
     genJob =
       viewModelScope.launch {
         val backend = engine.loadedBackend ?: Backend.CPU
@@ -723,32 +739,63 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
           if (tools.map { it.name } != offered) {
             offered = tools.map { it.name }
             engine.setTools(tools)
-            engine.reset(systemPrompt(), modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }))
+            engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) })
           }
           if (embedder.loaded && _state.value.messages.any { m -> m.attachments.any { (it.media as? Media.Document)?.index != null } }) updateReply(reply.id) { it.copy(activity = Activity.EMBEDDINGS) }
-          var turnText = withExcerpts(modelText(user), user.text)
+          // a document's text is parsed (sheets into rows) and later hashed: not on the main thread
+          var turnText = withExcerpts(withContext(Dispatchers.Default) { modelText(user) }, user.text)
           var turnMedia = atts.map { it.media }
-          // photos: the chat model sees the picture, the OCR model writes down any text in it
+          val photoTables = ArrayList<TableHints.Table>()
+          // photos: the chat model sees the picture and reads most text in it itself, in seconds on the NPU. It loses
+          // track in tables, receipts and forms (which price is on which line), so only those, or a request for the
+          // exact text, also go through the OCR model (40 s or more on the CPU)
           val photos = atts.filter { it.kind == AttachmentKind.IMAGE && it.uri != null }
           if (s.settings.ocr && ocr.ready && photos.isNotEmpty()) {
             updateReply(reply.id) { it.copy(activity = Activity.OCR) }
+            val exact = WANTS_EXACT_TEXT.containsMatchIn(user.text)
             for ((i, p) in photos.withIndex()) {
               if (stopRequested) break
-              GenerationService.progress(app, "MiniCPM-OCR reading the text in photo ${i + 1} of ${photos.size}")
+              if (!exact) {
+                val small = withContext(Dispatchers.IO) { runCatching { MediaDecoder.image(app.contentResolver, p.uri!!, PHOTO_CHECK_SIDE) }.getOrNull() }
+                val t0 = System.currentTimeMillis()
+                val table = small?.let { engine.looksLikeTable(it) }
+                AppLog.i("photo ${i + 1} checked in ${System.currentTimeMillis() - t0} ms: ${if (table == false) "no table, read by the chat model alone" else "table, receipt or form: reading it with Xiaomi-OCR"}")
+                if (table == false) continue
+              }
+              GenerationService.progress(app, "Xiaomi-OCR reading the text in photo ${i + 1} of ${photos.size}")
               val bmp = withContext(Dispatchers.IO) { runCatching { MediaDecoder.bitmap(app.contentResolver, p.uri!!, 2500) }.getOrNull() } ?: continue
               val read = runCatching { ocr.read(bmp) { msg -> GenerationService.progress(app, msg) } }.onFailure { AppLog.e("OCR failed", it) }.getOrNull()
-              if (!read.isNullOrBlank()) turnText += "\n\n<image_text image=\"${i + 1}\" read_by=\"OCR\">\n$read\n</image_text>"
+              if (!read.isNullOrBlank()) {
+                turnText += "\n\n<image_text image=\"${i + 1}\" read_by=\"OCR\">\n$read\n</image_text>"
+                photoTables += TableHints.tables("photo ${i + 1}", read)
+              }
             }
             updateReply(reply.id) { it.copy(activity = Activity.READING_IMAGE) }
           }
+          // a question about a table: the rows, counts and columns it names, worked out here. After the documents, so
+          // their saved state still matches
+          tableHints(user.text, photoTables)?.let { h ->
+            val at = turnText.lastIndexOf(DOC_END).let { if (it < 0) 0 else it + DOC_END.length }
+            val with = turnText.substring(0, at) + h + "\n\n" + turnText.substring(at)
+            // only when the answer still has room: they help, but a full context means no answer at all
+            val (used, size) = engine.context()
+            val need = engine.tokenCount(with)
+            if (need == null || size == 0 || used + need + ANSWER_ROOM_TOKENS <= size) turnText = with
+            else AppLog.w("table hints left out: ${need} tokens with them, ${size - used} free")
+          }
           if (offered.isNotEmpty()) turnText += TOOL_HINT
-          val cacheKey = docCacheKey(user, turnText, s.settings)
+          val cacheKey = withContext(Dispatchers.Default) { docCacheKey(user, turnText, s.settings) }
           var role = "user"
           val sources = ArrayList<Source>()
           var calls = 0
           val tried = HashSet<ToolCall>()
           var nudged = false
           while (true) {
+            // Stop pressed while a tool ran (a web search takes up to 45 s) or photos were read: no further pass
+            if (stopRequested) {
+              if (sb.isEmpty()) updateReply(reply.id) { it.copy(text = "Stopped.") }
+              break
+            }
             var passTokens = 0
             val raw = StringBuilder()
             engine.generate(turnText, turnMedia, s.settings.temperature, s.settings.maxTokens, role, cacheKey.takeIf { role == "user" }).collect { ev ->
@@ -762,20 +809,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 is GenEvent.Piece -> {
                   raw.append(ev.text)
-                  // a tool call is for the app, not the reader: show only what comes before it
-                  val visible = uncited(sb.toString() + raw.toString().substringBefore("<tool_call>"), sources)
-                  if (ttft == 0L && visible.isNotBlank()) ttft = System.currentTimeMillis() - t0
+                  if (ttft == 0L && (sb.isNotBlank() || raw.toString().substringBefore("<tool_call>").isNotBlank())) ttft = System.currentTimeMillis() - t0
                   genTokens = ev.genTokens
                   genMs = ev.genMillis
                   val tps = if (ev.genMillis > 0) ev.genTokens * 1000f / ev.genMillis else 0f
-                  _state.update { it.copy(liveTps = tps) }
                   val now = System.currentTimeMillis()
                   if (now - lastNotify > 2000) {
                     lastNotify = now
                     GenerationService.progress(app, "Writing the reply · ${ev.genTokens} tokens · ${"%.1f".format(tps)} tok/s")
                   }
-                  updateReply(reply.id) {
-                    it.copy(text = visible, activity = Activity.WRITING, live = it.live?.copy(genTokens = ev.genTokens, tps = tps))
+                  // the screen gets the text ~16 times a second, not per token: every update rebuilds the reply and the
+                  // page re-reads its Markdown, work that grows with the reply (the pass's end shows the rest)
+                  if (now - lastShown >= TEXT_FRAME_MS) {
+                    lastShown = now
+                    // a tool call is for the app, not the reader: show only what comes before it
+                    val visible = uncited(sb.toString() + raw.toString().substringBefore("<tool_call>"), sources)
+                    _state.update { st ->
+                      st.copy(
+                        liveTps = tps,
+                        messages = st.messages.map { m ->
+                          if (m.id == reply.id) m.copy(text = visible, activity = Activity.WRITING, live = m.live?.copy(genTokens = ev.genTokens, tps = tps)) else m
+                        },
+                      )
+                    }
                   }
                 }
                 is GenEvent.Done -> {
@@ -787,6 +843,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                   finished = true
                 }
               }
+            }
+            // whatever the last throttled frame didn't show
+            if (raw.isNotEmpty()) {
+              val visible = uncited(sb.toString() + raw.toString().substringBefore("<tool_call>"), sources)
+              updateReply(reply.id) { it.copy(text = visible, live = it.live?.copy(genTokens = genTokens)) }
             }
             sb.append(raw.toString().substringBefore("<tool_call>"))
             val cutOff = passTokens >= s.settings.maxTokens
@@ -833,8 +894,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
           updateReply(reply.id) { it.copy(text = sb.toString().ifEmpty { message }, error = sb.isEmpty()) }
           if (e.needsReset) {
             // the KV cache is unknown after a failed prompt: rebuild it from the turns before this one
-            engine.reset(systemPrompt(), modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }))
+            engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) })
           }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+          throw e
+        } catch (e: Throwable) {
+          // anything else (a full disk, a tool that threw): the reply fails, the app stays up
+          AppLog.e("reply failed", e)
+          updateReply(reply.id) { it.copy(text = sb.toString().ifEmpty { "Something went wrong: ${e.message ?: e.javaClass.simpleName}" }, error = sb.isEmpty()) }
         } finally {
           sampler.cancel()
           val run =
@@ -863,6 +930,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
               )
             else null
           updateReply(reply.id) { it.copy(activity = Activity.DONE, run = run) }
+          dropMedia(user.id)
           GenerationService.stop(app, sb.toString().trim().lineSequence().firstOrNull()?.take(80)?.let { "Reply ready: $it" })
           _state.update { it.copy(generating = false, runs = if (run != null) it.runs + run else it.runs) }
           runCatching { saveChat() }.onFailure { AppLog.e("saving chat failed", it) }
@@ -874,7 +942,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             writeSettings(s)
             loadModel()
           }
-          if (run != null) statsStore.append(run)
+          if (run != null) runCatching { statsStore.append(run) }.onFailure { AppLog.e("saving the run's stats failed", it) }
         }
       }
   }
@@ -970,14 +1038,45 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
   }
 
+  /** The longest opening of [text], cut at a line, that the model reads in at most [budget] tokens. */
+  private suspend fun fitTokens(name: String, text: String, budget: Int): String {
+    var t = text
+    repeat(4) {
+      val n = engine.tokenCount(TableHints.forModel(name, t, partial = t.length < text.length)) ?: return t
+      if (n <= budget) return t
+      t = t.take((t.length.toLong() * budget / n * 95 / 100).toInt()).let { c -> c.substringBeforeLast('\n', c) }
+    }
+    return t
+  }
+
+  /** What [question] names in the tables attached to this chat and read from this message's photos; see [TableHints]. */
+  private suspend fun tableHints(question: String, photoTables: List<TableHints.Table>): String? {
+    val docs = _state.value.messages.flatMap { it.attachments }.mapNotNull { it.media as? Media.Document }.distinctBy { it.name to it.text }
+    return withContext(Dispatchers.Default) {
+      runCatching { TableHints.hints(docs.flatMap(::tablesOf) + photoTables, question) }.onFailure { AppLog.e("table hints failed", it) }.getOrNull()
+    }
+  }
+
+  // a document's tables, parsed once rather than for every question (keyed by the document object; weakly held)
+  private val tableCache = java.util.WeakHashMap<Media.Document, List<TableHints.Table>>()
+
+  private fun tablesOf(d: Media.Document): List<TableHints.Table> =
+    synchronized(tableCache) { tableCache[d] }
+      ?: (if (d.table != null) TableHints.tables(d.name, d.table) else TableHints.tables(d.name, d.text, partial = d.truncated || d.index != null))
+        .also { synchronized(tableCache) { tableCache[d] = it } }
+
+  /** All of a spreadsheet too big for the context, for finding the rows a question names (null: not a sheet, or cut). */
+  private fun wholeSheet(name: String, full: Media.Document) = full.text.takeIf { !full.truncated && TableHints.isSheet(name) }
+
   /** For a long document searched by meaning, the passages that answer [question], appended to the turn. */
   private suspend fun withExcerpts(turn: String, question: String): String {
     if (!embedder.loaded || question.isBlank()) return turn
     val docs = _state.value.messages.flatMap { it.attachments }.mapNotNull { (it.media as? Media.Document)?.takeIf { d -> d.index != null } }.distinctBy { it.index }
     if (docs.isEmpty()) return turn
+    val q = embedder.query(question) ?: return turn // once, for every document
     val block = buildString {
       for (d in docs) {
-        val found = runCatching { semantic.searchDocument(d.index!!, question) }.getOrDefault(emptyList())
+        val found = runCatching { semantic.searchDocument(d.index!!, q) }.getOrDefault(emptyList())
         if (found.isEmpty()) continue
         append("<document_excerpts name=\"").append(d.name).append("\">\n")
         found.forEach { append(it.text).append("\n…\n") }
@@ -1062,12 +1161,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
   }
 
-  /** Downloads MiniCPM-OCR once when it is turned on; it loads only while reading. */
+  /** Downloads Xiaomi-OCR-0 once when it is turned on; it loads only while reading. */
   private fun startOcr() {
     if (!_state.value.settings.ocr) return
     viewModelScope.launch {
       try {
-        for (m in listOfNotNull(Models.OCR, Models.OCR_VISION.takeUnless { ocr.converted }).filterNot(store::isReady)) {
+        for (m in listOf(Models.OCR, Models.OCR_VISION).filterNot(store::isReady)) {
           val mb = m.size shr 20
           _state.update { it.copy(ocrStatus = "Downloading ${m.name.removeSuffix(".gguf")} (0 of $mb MB)") }
           store.downloadOne(m) { done -> _state.update { it.copy(ocrStatus = "Downloading ${m.name.removeSuffix(".gguf")} (${done shr 20} of $mb MB)") } }
@@ -1182,7 +1281,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
   private var liveJob: Job? = null
 
   /**
-   * Starts live transcribe: the mic keeps recording and every [LIVE_CHUNK_SECONDS] or so (longer when the phone is
+   * Starts live transcribe: the mic keeps recording and every [Settings.liveSeconds] or so (longer when the phone is
    * slower than that) the new audio is written down. Cuts are moved to the quietest moment near the end of each piece,
    * so words aren't split in half. The model only transcribes; it doesn't answer.
    */
@@ -1197,6 +1296,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val app = getApplication<Application>()
     runCatching { LiveTranscribeService.start(app) }.onFailure { AppLog.w("live transcribe service: ${it.message}") }
     val lang = (VoiceLanguages[s.settings.voiceLang] ?: "English").substringBefore(" (")
+    val seconds = s.settings.liveSeconds
+    AppLog.i("live transcribe: $seconds s blocks")
     liveJob =
       viewModelScope.launch {
         var buf = FloatArray(0)
@@ -1204,31 +1305,238 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         while (true) {
           val recording = rec.isRecording
           buf += withContext(Dispatchers.IO) { rec.take() }
-          if (recording && buf.size < rate * LIVE_CHUNK_SECONDS) {
+          if (recording && buf.size < rate * seconds) {
+            liveWaiting = true
             delay(200)
             continue
           }
+          // a piece is ready: notes stop for it (they redo their step later)
+          liveWaiting = false
+          livePieces++
+          engine.stopNotes(true)
           if (buf.size < rate / 4) break
           val cut = if (recording) quietCut(buf, rate) else buf.size
           val piece = buf.copyOfRange(0, cut)
           buf = buf.copyOfRange(cut, buf.size)
           val at = consumed * 1000 / rate
           consumed += cut
-          if (peakLevel(piece) >= 0.01) {
+          // a quiet room still gets something written ("Thank you." every block): only blocks with speech are sent
+          val share = com.saad.omnichat.media.SpeechGate.speechShare(piece, rate)
+          if (share >= com.saad.omnichat.media.SpeechGate.MIN_SHARE) {
             _state.update { it.copy(voice = it.voice.copy(live = it.voice.live?.copy(writing = true))) }
             val text = runCatching { engine.transcribe(piece, lang) }.onFailure { AppLog.e("live transcribe failed", it) }.getOrDefault("").let(::dropFiller)
+              .let { t -> if (share < 0.2 && com.saad.omnichat.media.SpeechGate.isSilencePhrase(t)) "" else t }
             _state.update { st ->
               val l = st.voice.live ?: return@update st
-              st.copy(voice = st.voice.copy(live = l.copy(writing = false, lines = if (text.isBlank()) l.lines else l.lines + LiveLine(at, text))))
+              st.copy(voice = st.voice.copy(live = l.copy(writing = false, lines = if (text.isBlank()) l.lines else l.lines + LiveLine(at, text, cut * 1000L / rate))))
             }
+            if (text.isNotBlank()) saveLive()
             _state.value.voice.live?.let { l -> runCatching { LiveTranscribeService.progress(app, "${LiveTranscript.stamp(consumed * 1000 / rate)} · ${l.lines.size} parts · ${l.lines.lastOrNull()?.text?.takeLast(60).orEmpty()}") } }
           }
+          engine.stopNotes(false)
           if (!recording && buf.size < rate / 4) break
         }
+        liveWaiting = true
+        engine.stopNotes(false)
         _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.copy(running = false, writing = false))) }
+        saveLive()
         LiveTranscribeService.stop(app)
       }
     liveJob?.invokeOnCompletion { LiveTranscribeService.stop(app) }
+    if (s.settings.meetingNotes) startNotes()
+  }
+
+  // true while the live loop waits for audio to build up: the time notes may use the model
+  @Volatile private var liveWaiting = true
+  @Volatile private var livePieces = 0L // pieces taken: a notes step that saw this change was stopped, not failed
+  private var notesJob: Job? = null
+  private var summaryWanted = false
+
+  /**
+   * Meeting notes while live transcribe listens (see [MeetingNotes]): each new line is checked for action items and
+   * decisions, each finished minute gets a key point or two, and when listening stops a summary is written. A step
+   * runs only while the live loop waits for audio, and a piece that becomes ready stops it at once; the step is then
+   * done again later. So transcription is never kept waiting.
+   */
+  private fun startNotes() {
+    notesJob?.cancel()
+    notesJob =
+      viewModelScope.launch {
+        var fails = 0
+        while (isActive) {
+          val l = _state.value.voice.live ?: break
+          val step = nextNoteStep(l)
+          if (step == null) {
+            if (!l.running && notesJob?.isActive == true && liveJob?.isActive != true) break
+            delay(500)
+            continue
+          }
+          if (l.running && !liveWaiting) {
+            delay(150)
+            continue
+          }
+          _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.copy(noting = true))) }
+          val t0 = System.currentTimeMillis()
+          val pieces = livePieces
+          val done = runCatching { step() }.onFailure { AppLog.e("meeting notes failed", it) }.getOrDefault(false)
+          val stopped = !done && livePieces != pieces
+          _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.copy(noting = false))) }
+          if (done) {
+            fails = 0
+            saveLive()
+          } else if (!stopped && ++fails >= 3) {
+            // the same step keeps failing (not just stopped for a piece): skip it rather than loop
+            AppLog.w("meeting notes: skipping a step after 3 tries")
+            skipNoteStep()
+            fails = 0
+          }
+          AppLog.i("meeting notes: step ${if (done) "done" else if (stopped) "stopped for a piece" else "failed"} in ${System.currentTimeMillis() - t0} ms")
+        }
+        _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.copy(noting = false))) }
+      }
+  }
+
+  /** The next notes step for [l] as work to do, or null when the notes are up to date; it returns false if it didn't finish. */
+  private fun nextNoteStep(l: LiveTranscript): (suspend () -> Boolean)? {
+    val lines = l.lines.map { MeetingNotes.Line(it.at, it.text) }
+    return when (val step = MeetingNotes.nextStep(lines, l.notes, l.running, summaryWanted)) {
+      null -> null
+      is MeetingNotes.Step.CheckLine -> {
+        {
+          val line = lines[step.index]
+          var items = l.notes.items
+          var complete = true
+          // each sentence with the ones around it, across line breaks ("…the delivery date. That's me, Ben.")
+          val before = lines.getOrNull(step.index - 1)?.let { MeetingNotes.sentences(it.text).lastOrNull() }.orEmpty()
+          val after = lines.getOrNull(step.index + 1)?.let { MeetingNotes.sentences(it.text).firstOrNull() }.orEmpty()
+          val said = listOf(before) + MeetingNotes.sentences(line.text) + listOf(after)
+          for (i in 1 until said.size - 1) {
+            val c = said[i]
+            if (!MeetingNotes.isCandidate(c)) continue
+            val reply = engine.notesAsk(MeetingNotes.SYSTEM, MeetingNotes.itemQuestion(said[i - 1], c, said[i + 1]), 40)
+            if (reply == null) { complete = false; break }
+            MeetingNotes.parseItem(reply, line.at, said[i - 1] + " " + c + " " + said[i + 1])?.let { items = MeetingNotes.addItem(items, it) }
+          }
+          if (complete) updateNotes { it.copy(items = items, decisions = it.decisions + MeetingNotes.decisions(line.text, line.at), checked = step.index + 1) }
+          complete
+        }
+      }
+      is MeetingNotes.Step.Minute -> {
+        {
+          if (step.text == null) {
+            updateNotes { it.copy(minutes = step.minute + 1) }
+            true
+          } else {
+            val reply = engine.notesAsk(MeetingNotes.SYSTEM, MeetingNotes.pointsQuestion(step.text), 80)
+            if (reply != null) updateNotes { it.copy(points = MeetingNotes.addPoints(it.points, MeetingNotes.parsePoints(reply, step.text, step.minute * MeetingNotes.MINUTE)), minutes = step.minute + 1) }
+            reply != null
+          }
+        }
+      }
+      MeetingNotes.Step.Summary -> {
+        {
+          val summary = summarize(l.notes)
+          if (summary != null) {
+            summaryWanted = false
+            updateNotes { it.copy(summary = summary) }
+          }
+          summary != null
+        }
+      }
+    }
+  }
+
+  private fun skipNoteStep() {
+    val l = _state.value.voice.live ?: return
+    when (val step = MeetingNotes.nextStep(l.lines.map { MeetingNotes.Line(it.at, it.text) }, l.notes, l.running, summaryWanted)) {
+      is MeetingNotes.Step.CheckLine -> updateNotes { it.copy(checked = step.index + 1) }
+      is MeetingNotes.Step.Minute -> updateNotes { it.copy(minutes = step.minute + 1) }
+      MeetingNotes.Step.Summary -> { summaryWanted = false; updateNotes { it.copy(summary = it.summary ?: "") } }
+      null -> {}
+    }
+  }
+
+  /**
+   * The whole meeting in a few sentences, from its key points (an hour has ~100). More than fit the side context at
+   * once are summarized in groups first, and the group summaries then make the final one.
+   */
+  private suspend fun summarize(n: MeetingNotes.Notes): String? {
+    var points = n.points
+    while (points.size > SUMMARY_GROUP) {
+      val groups = points.chunked(SUMMARY_GROUP).map { g ->
+        engine.notesAsk(MeetingNotes.SYSTEM, MeetingNotes.summaryQuestion(g, emptyList(), emptyList()), 160) ?: return null
+      }
+      points = groups.mapIndexed { i, t -> MeetingNotes.KeyPoint(points[i * SUMMARY_GROUP].at, t.replace("\n", " ")) }
+    }
+    return engine.notesAsk(MeetingNotes.SYSTEM, MeetingNotes.summaryQuestion(points, n.decisions, n.items), 220)
+  }
+
+  private fun updateNotes(f: (MeetingNotes.Notes) -> MeetingNotes.Notes) =
+    _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.let { it.copy(notes = f(it.notes)) })) }
+
+  /** Writes a summary now (while listening it waits for a pause between pieces). */
+  fun liveSummarize() {
+    val l = _state.value.voice.live ?: return
+    summaryWanted = true
+    updateNotes { it.copy(summary = null) }
+    if (notesJob?.isActive != true) startNotes()
+    if (l.notes.points.size < 2) notice("Summaries need a couple of minutes of transcript first")
+  }
+
+  /** Bookmarks this moment of the recording. */
+  fun liveMark() {
+    val l = _state.value.voice.live ?: return
+    if (!l.running) return
+    val at = System.currentTimeMillis() - l.started
+    _state.update { st -> st.copy(voice = st.voice.copy(live = st.voice.live?.copy(marks = st.voice.live.marks + at))) }
+    saveLive()
+  }
+
+  /** A new chat with the transcript and its notes attached, to ask anything about the meeting. */
+  fun liveAskInChat() {
+    val l = _state.value.voice.live ?: return
+    if (l.lines.isEmpty()) return
+    val app = getApplication<Application>()
+    viewModelScope.launch {
+      val name = "Meeting " + java.text.SimpleDateFormat("yyyy-MM-dd HHmm", java.util.Locale.US).format(java.util.Date(l.started)) + ".md"
+      val f = withContext(Dispatchers.IO) { runCatching { java.io.File(app.cacheDir, "meetings").apply { mkdirs() }.resolve(name).apply { writeText(l.markdown()) } }.getOrNull() }
+        ?: return@launch notice("Couldn't write the meeting to a file for the chat")
+      newChat()
+      attach(listOf(Uri.fromFile(f)))
+    }
+  }
+
+  private val liveFile get() = java.io.File(getApplication<Application>().filesDir, "live-transcript.json")
+  private val liveSaveLock = kotlinx.coroutines.sync.Mutex()
+
+  /** Auto-save: the transcript and notes as they stand, written whole to a new file that then replaces the old. */
+  private fun saveLive() {
+    val l = _state.value.voice.live ?: return
+    viewModelScope.launch(Dispatchers.IO) {
+      liveSaveLock.withLock {
+        runCatching {
+          val tmp = java.io.File(liveFile.path + ".tmp")
+          tmp.writeText(l.toJson().toString())
+          tmp.renameTo(liveFile)
+        }.onFailure { AppLog.w("live transcript auto-save failed: ${it.message}") }
+      }
+    }
+  }
+
+  /** A transcript auto-saved before the app closed (a crash, the phone restarting): back on the page, stopped. */
+  private fun restoreLive() {
+    viewModelScope.launch {
+      val saved = withContext(Dispatchers.IO) { runCatching { liveFile.takeIf { it.exists() }?.readText()?.let { LiveTranscript.fromJson(JSONObject(it)) } }.getOrNull() }
+      if (saved == null || saved.lines.isEmpty() || _state.value.voice.live != null) return@launch
+      _state.update { it.copy(voice = it.voice.copy(live = saved)) }
+      AppLog.i("live transcript restored: ${saved.lines.size} parts")
+      // notes it hadn't caught up with are finished once the model is loaded
+      if (_state.value.settings.meetingNotes) viewModelScope.launch {
+        while (_state.value.phase != Phase.Ready) delay(500)
+        if (_state.value.voice.live === saved) startNotes()
+      }
+      // no chat notice: the chat's live-transcript banner (with Open) shows it, and goes away when it is closed
+    }
   }
 
   /** Stops listening; what was said last is still written down. */
@@ -1245,14 +1553,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
   fun liveClose() {
     liveMic?.let { m -> liveMic = null; viewModelScope.launch(Dispatchers.IO) { m.end() } }
     liveJob?.cancel()
+    notesJob?.cancel()
+    engine.stopNotes(true)
+    summaryWanted = false
     _state.update { it.copy(voice = it.voice.copy(live = null)) }
+    viewModelScope.launch(Dispatchers.IO) { liveSaveLock.withLock { liveFile.delete() } }
   }
 
-  fun liveSave(uri: Uri?, stamps: Boolean) {
-    val t = _state.value.voice.live ?: return
+  /** What a saved transcript holds. */
+  enum class LiveFormat { STAMPED, PLAIN, MARKDOWN, SUBTITLES }
+
+  fun liveText(format: LiveFormat): String? {
+    val t = _state.value.voice.live ?: return null
+    return when (format) {
+      LiveFormat.STAMPED -> t.export(true)
+      LiveFormat.PLAIN -> t.export(false)
+      LiveFormat.MARKDOWN -> t.markdown()
+      LiveFormat.SUBTITLES -> t.srt(_state.value.settings.liveSeconds * 1000L)
+    }
+  }
+
+  fun liveSave(uri: Uri?, format: LiveFormat) {
+    val text = liveText(format) ?: return
     if (uri == null) return
     viewModelScope.launch(Dispatchers.IO) {
-      runCatching { getApplication<Application>().contentResolver.openOutputStream(uri)!!.use { it.write(t.export(stamps).toByteArray()) } }
+      runCatching { getApplication<Application>().contentResolver.openOutputStream(uri)!!.use { it.write(text.toByteArray()) } }
         .onSuccess { notice("Transcript saved") }
         .onFailure { AppLog.e("saving transcript failed", it); notice("Couldn't save the transcript: ${it.message}") }
     }
@@ -1336,6 +1661,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val sources = ArrayList<Source>()
             var calls = 0
             while (true) {
+              if (stopRequested) break
               val raw = StringBuilder()
               engine.speak(turnText, turnMedia, s.settings.temperature, 400, s.settings.voiceLang, s.settings.voiceGender, role).collect { ev ->
               when (ev) {
@@ -1371,10 +1697,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
           } catch (e: EngineException) {
             AppLog.e("voice reply failed: ${e.message}")
             updateReply(reply.id) { it.copy(text = text.toString().ifEmpty { e.message ?: "Couldn't answer" }, error = text.isEmpty()) }
-            if (e.needsReset) engine.reset(systemPrompt(), modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }))
+            if (e.needsReset) engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) })
+          } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+          } catch (e: Throwable) {
+            // the speaker couldn't start, a tool threw...: the reply fails, the app stays up
+            AppLog.e("voice reply failed", e)
+            updateReply(reply.id) { it.copy(text = text.toString().ifEmpty { "Something went wrong: ${e.message ?: e.javaClass.simpleName}" }, error = text.isEmpty()) }
           } finally {
-            player.finish()
+            runCatching { player.finish() }
             updateReply(reply.id) { it.copy(activity = Activity.DONE) }
+            dropMedia(user.id)
             _state.update { it.copy(generating = false) }
             GenerationService.stop(app, text.toString().trim().take(80).takeIf { it.isNotEmpty() }?.let { "Reply ready: $it" })
             runCatching { saveChat() }
@@ -1435,10 +1768,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
               updateReply(reply.id) { it.copy(activity = Activity.LISTENING, text = header + sb + "_Listening to part $i of $parts…_") }
               engine.reset(TRANSCRIBE_SYSTEM)
               val part = StringBuilder()
+              var shown = 0L
               engine.generate(TRANSCRIBE_PROMPT, listOf(Media.Audio(pcm)), 0f, 768).collect { ev ->
                 if (ev is GenEvent.Piece) {
                   part.append(ev.text)
-                  updateReply(reply.id) { it.copy(activity = Activity.WRITING, text = header + sb + stamp + part) }
+                  // throttled like a chat reply: a 2-hour transcript is 100k characters to rebuild and re-read per token
+                  val now = System.currentTimeMillis()
+                  if (now - shown >= TEXT_FRAME_MS) {
+                    shown = now
+                    updateReply(reply.id) { it.copy(activity = Activity.WRITING, text = header + sb + stamp + part) }
+                  }
                 }
               }
               if (part.isNotBlank()) {
@@ -1482,6 +1821,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
           } catch (e: EngineException) {
             AppLog.e("answer after transcription failed: ${e.message}")
+          } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+          } catch (e: Throwable) {
+            AppLog.e("answer after transcription failed", e)
           }
           updateReply(answer.id) { it.copy(activity = Activity.DONE, text = out.toString().ifEmpty { "No answer was produced." }) }
         }
@@ -1496,6 +1839,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val t = seconds.toLong()
     return if (t >= 3600) "%d:%02d:%02d".format(t / 3600, t / 60 % 60, t % 60) else "%d:%02d".format(t / 60, t % 60)
   }
+
+  /**
+   * Once the model has read a message, its photos' pixels and its audio (3 MB a photo, up to 38 MB a recording) are
+   * not needed again: they become the placeholders a reopened chat has. The picture is still shown, from its file.
+   */
+  private fun dropMedia(id: Long) =
+    _state.update { st ->
+      st.copy(messages = st.messages.map { m ->
+        if (m.id != id) m
+        else m.copy(attachments = m.attachments.map { a -> if (a.kind != AttachmentKind.DOCUMENT && a.media !is Media.Document) a.copy(media = Media.Document(a.label, "")) else a })
+      })
+    }
 
   private fun updateReply(id: Long, f: (ChatMessage) -> ChatMessage) =
     _state.update { s -> s.copy(messages = s.messages.map { if (it.id == id) f(it) else it }) }
@@ -1525,6 +1880,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       firecrawlKey = prefs.getString("firecrawlKey", "") ?: "",
       voiceLang = prefs.getString("voiceLang", "en") ?: "en",
       voiceGender = prefs.getString("voiceGender", "female") ?: "female",
+      liveSeconds = prefs.getInt("liveSeconds", LIVE_SECONDS_DEFAULT).coerceIn(LIVE_SECONDS_RANGE),
+      meetingNotes = prefs.getBoolean("meetingNotes", true),
       phoneTools = prefs.getBoolean("phoneTools", true),
       smartSearch = prefs.getBoolean("smartSearch", false),
       gallerySearch = prefs.getBoolean("gallerySearch", false),
@@ -1549,6 +1906,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       .putString("firecrawlKey", s.firecrawlKey.trim())
       .putString("voiceLang", s.voiceLang)
       .putString("voiceGender", s.voiceGender)
+      .putInt("liveSeconds", s.liveSeconds)
+      .putBoolean("meetingNotes", s.meetingNotes)
       .putBoolean("phoneTools", s.phoneTools)
       .putBoolean("smartSearch", s.smartSearch)
       .putBoolean("gallerySearch", s.gallerySearch)
@@ -1559,7 +1918,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
   override fun onCleared() {
     galleryJob?.cancel()
+    liveJob?.cancel()
+    notesJob?.cancel()
     engine.abort()
-    mic?.stop()
+    engine.stopNotes(true)
+    runCatching { player.stop() }
+    // every open mic is closed (one left recording grows its buffer without limit, and keeps the mic on), off the
+    // main thread: ending one waits for its reading thread
+    val mics = listOfNotNull(mic, liveMic, voiceMic)
+    mic = null
+    liveMic = null
+    voiceMic = null
+    kotlin.concurrent.thread(name = "mic-close") { mics.forEach { runCatching { it.end() } } }
   }
 }

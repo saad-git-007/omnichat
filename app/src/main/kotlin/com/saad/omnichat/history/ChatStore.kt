@@ -26,13 +26,22 @@ class ChatStore(context: Context) {
     withContext(Dispatchers.IO) {
       dir.listFiles { f -> f.extension == "json" }.orEmpty().mapNotNull { f ->
         runCatching {
-            // only the header fields; the messages are parsed when a chat is opened
-            val o = JSONObject(f.readText())
+            // only the header fields, which save() writes before the messages: a chat with documents attached is
+            // megabytes of JSON, and parsing all of it for a title made the list slow to appear
+            val o = header(f) ?: JSONObject(f.readText())
             ChatSummary(o.getLong("id"), o.optString("title", "Chat"), o.optLong("updated"))
           }
           .getOrNull()
       }.sortedByDescending { it.updated }
     }
+
+  /** The fields before "messages", read from the start of [f]; null when they aren't there. */
+  private fun header(f: File): JSONObject? {
+    val start = f.bufferedReader().use { r -> CharArray(HEADER_CHARS).let { b -> String(b, 0, maxOf(0, r.read(b))) } }
+    val at = start.indexOf(",\"messages\":")
+    if (at < 0) return null
+    return runCatching { JSONObject(start.substring(0, at) + "}") }.getOrNull()?.takeIf { it.has("id") }
+  }
 
   suspend fun load(id: Long): SavedChat? =
     withContext(Dispatchers.IO) {
@@ -77,4 +86,8 @@ class ChatStore(context: Context) {
     }
 
   suspend fun delete(id: Long) = withContext(Dispatchers.IO) { file(id).delete() }
+
+  private companion object {
+    const val HEADER_CHARS = 8192 // a title is a line of text
+  }
 }

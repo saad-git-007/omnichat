@@ -15,6 +15,7 @@ import com.saad.omnichat.llm.Media
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
 import com.tom_roush.pdfbox.cos.COSName
+import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
@@ -55,7 +56,17 @@ object DocumentReader {
       when {
         mime == "application/pdf" || ext == "pdf" -> pdf(context, uri, ocr, onPictures)
         mime == XLSX || ext == "xlsx" -> xlsx(context.contentResolver, uri)
-        else -> context.contentResolver.openInputStream(uri)!!.use { it.readBytes().toString(Charsets.UTF_8) }
+        // only as much as can be used: a 1 GB log read whole ran out of memory
+        else -> context.contentResolver.openInputStream(uri)!!.bufferedReader(Charsets.UTF_8).use { r ->
+          val out = StringBuilder()
+          val buf = CharArray(64 * 1024)
+          while (out.length <= maxChars) {
+            val n = r.read(buf)
+            if (n < 0) break
+            out.appendRange(buf, 0, n)
+          }
+          out.toString()
+        }
       }.trim()
     require(text.isNotEmpty()) { "No text found in $name" + if (ext == "pdf") " (scanned PDFs have no text; attach a photo of the page instead)" else "" }
     return if (text.length <= maxChars) Media.Document(name, text) else Media.Document(name, text.take(maxChars), truncated = true)
@@ -66,7 +77,8 @@ object DocumentReader {
     val pages = ArrayList<String>()
     val pictures = ArrayList<Picture>()
     context.contentResolver.openInputStream(uri)!!.use { input ->
-      PDDocument.load(input).use { doc ->
+      // past 64 MB the parsed document spills to temporary files instead of running out of memory
+      PDDocument.load(input, MemoryUsageSetting.setupMixed(64L shl 20).setTempDir(context.cacheDir)).use { doc ->
         val stripper = LayoutStripper()
         val seen = HashSet<Any>()
         for (n in 1..doc.numberOfPages) {
@@ -99,7 +111,7 @@ object DocumentReader {
 
   /** Renders part of a page (points, from its top left) at ~150 dpi and OCRs it. */
   private suspend fun readArea(page: PdfRenderer.Page, left: Float, top: Float, width: Float, height: Float, ocr: PageReader, what: String): String? {
-    // small print stays readable, and the OCR model cuts the picture into fewer 448 px slices (each takes seconds)
+    // small print stays readable, and the OCR model has fewer 32 px squares (one token each) to read
     val scale = minOf(150f / 72f, PAGE_MAX_SIDE / maxOf(width, height))
     val bmp = Bitmap.createBitmap((width * scale).toInt().coerceAtLeast(1), (height * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
     return try {
