@@ -44,6 +44,12 @@ sealed interface VoiceEvent {
 
   class Audio(val pcm: FloatArray, val sampleRate: Int) : VoiceEvent
 
+  /**
+   * How fast a spoken reply is going, after each sentence: [tokens] written in [writeMillis] (time spent writing
+   * only, not speaking), and [audioSeconds] of speech made in [speechMillis].
+   */
+  data class Speed(val tokens: Int, val writeMillis: Long, val audioSeconds: Double, val speechMillis: Long) : VoiceEvent
+
   data class Done(val millis: Long) : VoiceEvent
 }
 
@@ -77,7 +83,9 @@ class OmniEngine(context: Context) {
   var audioSampleRate = 16000
     private set
 
-  private var loadedModel = ""
+  /** The file loaded: the chat model, or the speech model live transcribe swaps in (see ChatViewModel.useSpeechModel). */
+  @Volatile var loadedModel = ""
+    private set
   private var toolsText = ""
 
   /**
@@ -112,6 +120,7 @@ class OmniEngine(context: Context) {
     ensureInit()
     return withContext(thread) {
       loadedBackend = null
+      loadedModel = ""
       // Adreno's Vulkan driver fails to compile the flash-attention kernel used for batches of 32+ tokens
       // (any image or audio prompt), so attention runs unfused there. -1 = llama.cpp decides.
       val flashAttn = if (backend.device.startsWith("Vulkan")) 0 else -1
@@ -136,6 +145,7 @@ class OmniEngine(context: Context) {
     withContext(thread) {
       LlamaNative.nativeUnload()
       loadedBackend = null
+      loadedModel = ""
     }
 
   /** Starts a chat; [history] holds (role, text) of earlier turns when reopening a saved conversation. */
@@ -297,6 +307,9 @@ class OmniEngine(context: Context) {
         var audioSamples = 0L
         var rate = 0
         var speechNs = 0L
+        var tokens = 0
+        var writeNs = 0L
+        fun speed(speakingNs: Long) = VoiceEvent.Speed(tokens, writeNs / 1_000_000, if (rate > 0) audioSamples.toDouble() / rate else 0.0, speakingNs / 1_000_000)
 
         suspend fun say(sentence: String) {
           // a tool call is for the app: never read it out
@@ -306,7 +319,7 @@ class OmniEngine(context: Context) {
           when (LlamaNative.nativeSpeakStart(clean, lang, voice)) {
             0 -> {}
             6 -> throw EngineException("This model file can't speak")
-            else -> throw EngineException(LlamaNative.nativeLastError() ?: "Speaking failed")
+            else -> throw EngineException(LlamaNative.nativeLastError() ?: "Speaking failed", needsReset = true)
           }
           rate = LlamaNative.nativeVoiceRate()
           while (true) {
@@ -314,8 +327,9 @@ class OmniEngine(context: Context) {
             LlamaNative.nativeVoiceAudio().takeIf { it.isNotEmpty() }?.let {
               audioSamples += it.size
               emit(VoiceEvent.Audio(it, rate))
+              emit(speed(speechNs + (System.nanoTime() - s0)))
             }
-            if (st < 0) throw EngineException(LlamaNative.nativeLastError() ?: "Speaking failed")
+            if (st < 0) throw EngineException(LlamaNative.nativeLastError() ?: "Speaking failed", needsReset = true)
             if (st != 0) break
           }
           speechNs += System.nanoTime() - s0
@@ -325,7 +339,12 @@ class OmniEngine(context: Context) {
         val full = StringBuilder()
         try {
           while (true) {
-            val piece = LlamaNative.nativeNext() ?: break
+            val w0 = System.nanoTime()
+            val piece = LlamaNative.nativeNext()
+            writeNs += System.nanoTime() - w0
+            if (piece == null) break
+            tokens++
+            if (tokens % 8 == 0) emit(speed(speechNs))
             if (piece.isEmpty()) continue
             emit(VoiceEvent.Text(piece))
             full.append(piece)

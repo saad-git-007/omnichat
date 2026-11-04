@@ -117,6 +117,10 @@ data class Settings(
   val liveSeconds: Int = LIVE_SECONDS_DEFAULT,
   // ...and meanwhile notes action items, decisions and key points, between pieces (see MeetingNotes)
   val meetingNotes: Boolean = true,
+  // voice chat shows how fast it reads, writes and speaks
+  val voiceSpeed: Boolean = true,
+  // ...with LFM3-Audio, swapped in for the chat model while it listens (downloads 1.35 GB once)
+  val speechModel: Boolean = true,
   // the model may use the phone: alarms, calendar, messages, maps, calculator... (each opens the app to confirm)
   val phoneTools: Boolean = true,
   // EmbeddingGemma 2: search past chats and long documents by meaning (downloads 310 MB once)
@@ -141,8 +145,22 @@ val VoiceLanguages =
 
 enum class VoicePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
+/** The speed line of voice chat: [readMillis] to read the picture and question, then writing and voice speed. */
+data class VoiceSpeed(val promptTokens: Int, val readMillis: Long, val tokensPerSecond: Float? = null, val realTime: Float? = null)
+
 /** Voice chat screen state; its turns are also added to the chat. */
-data class VoiceUi(val phase: VoicePhase = VoicePhase.IDLE, val reply: String = "", val photo: Attachment? = null, val live: LiveTranscript? = null)
+data class VoiceUi(
+  val phase: VoicePhase = VoicePhase.IDLE,
+  val reply: String = "",
+  val photo: Attachment? = null,
+  val live: LiveTranscript? = null,
+  // live camera: each question goes with what the camera sees as you finish asking ([frontCamera]: the selfie one)
+  val camera: Boolean = false,
+  val frontCamera: Boolean = false,
+  // with the camera on, the conversation is hands-free: true once your voice is heard (it sends when you pause)
+  val heard: Boolean = false,
+  val speed: VoiceSpeed? = null,
+)
 
 /** A saved custom instruction, applied to the system prompt of every new chat while enabled. */
 data class Instruction(val id: Long, val text: String, val enabled: Boolean = true)
@@ -174,6 +192,8 @@ data class UiState(
   val chatId: Long? = null, // saved conversation shown, null until the first reply of a new chat
   val searchStatus: String? = null, // smart search: download / indexing progress, shown in Settings
   val ocrStatus: String? = null, // OCR model download progress, shown in Settings
+  val speechStatus: String? = null, // LFM3-Audio download progress, shown in Settings
+  val liveModel: String? = null, // the model live transcribe writes with ("LFM3-Audio", or loading it)
   val conversation: Int = 0, // bumped when another chat is shown, so the message list starts fresh
   val micMode: MicMode = MicMode.DICTATE, // what the running recording is for
   val dictated: String? = null, // words from the last dictation, for the input field to take
@@ -196,10 +216,23 @@ private const val STAMP_EVERY_SECONDS = 300
 
 private const val MAX_TOOL_CALLS = 4
 
+// a camera frame for the model: the image encoder sees it in 512 px tiles, so larger only costs time
+private const val CAMERA_MAX_SIDE = 1024
+private const val CAMERA_KEEP = 20
+private const val SPEECH_BUSY = "Live transcribe is using the speech model. Stop it (and let its notes finish) to chat."
 private const val MIC_BUSY = "The microphone couldn't be opened. Another app (or a call) may be using it, or the permission was turned off."
 
 /** Largest context that fits the Hexagon NPU's ~3.1 GB address space next to the model and its encoders. */
 const val NPU_MAX_CTX = 32768
+// the speech model's own chat context: unused (live transcribe and its notes run in the 2k side context)
+private const val SPEECH_CTX = 2048
+
+// hands-free listening (camera conversations): a 1.2 s pause ends a question, and 30 s of talking sends it anyway
+private const val PAUSE_MS = 1200
+private const val MAX_UTTERANCE_MS = 30_000
+
+/** Room kept free for a camera turn: the picture (~1k tokens), the spoken question and the answer. */
+private const val CAMERA_TURN_ROOM = 3000
 
 /** Asking for the words themselves ("read it out", "transcribe this", "extract the text"): the OCR model reads exactly. */
 private val WANTS_EXACT_TEXT = Regex("""\b(read (it|this|out|all|the text|everything)|transcribe|extract|copy (the|all|out)|word for word|exact (text|words|wording)|all the text|what does (it|this) say|type (it|this) out)""", RegexOption.IGNORE_CASE)
@@ -307,7 +340,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             },
           )
         }
-      if (_state.value.phase == Phase.Ready) engine.reset(systemPrompt(), modelHistory(messages))
+      if (_state.value.phase == Phase.Ready && !speechLoaded) engine.reset(systemPrompt(), modelHistory(messages))
       _state.update { it.copy(messages = messages, chatId = chat.id, liveTps = null, conversation = it.conversation + 1) }
     }
   }
@@ -446,10 +479,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       val nCtx = if (backend.device.startsWith("HTP")) minOf(s.nCtx, NPU_MAX_CTX) else s.nCtx
       if (nCtx < s.nCtx) notice("The NPU has room for a 32k context, so ${s.nCtx / 1024}k is used on the CPU only. On the NPU the context is 32k (about 70,000 characters of document).")
       val info = engine.load(model.path, store.file(Models.MMPROJ).path, backend, nCtx, s.threads, s.mediaOnGpu)
+      chatModelPath = model.path
       engine.reset(systemPrompt())
-      _state.update { it.copy(phase = Phase.Ready, deviceInfo = info) }
+      _state.update { it.copy(phase = Phase.Ready, deviceInfo = info, liveModel = null) }
       startSearch()
       startOcr()
+      startSpeech()
       true
     } catch (e: EngineException) {
       AppLog.e("load failed: ${e.message}")
@@ -517,7 +552,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     // the system prompt lives at the start of the KV cache: an empty chat picks it up now, a running one from the next chat
     val s = _state.value
     if (s.phase == Phase.Ready && !s.generating) {
-      if (s.messages.isEmpty()) viewModelScope.launch { engine.reset(systemPrompt()) }
+      if (s.messages.isEmpty()) viewModelScope.launch { if (!speechLoaded) engine.reset(systemPrompt()) }
       else instructionsChanged = true
     }
   }
@@ -547,6 +582,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     if (new.galleryMonths != old.galleryMonths) galleryJob?.cancel()
     if (new.smartSearch != old.smartSearch || new.gallerySearch != old.gallerySearch || new.galleryMonths != old.galleryMonths) startSearch()
     if (new.ocr && !old.ocr) startOcr()
+    if (new.speechModel && !old.speechModel) startSpeech()
     val needsReload = new.backend != old.backend || new.nCtx != old.nCtx || new.threads != old.threads || new.mediaOnGpu != old.mediaOnGpu || new.fastHead != old.fastHead
     if (needsReload && store.allReady() && !_state.value.generating) {
       _state.update { it.copy(messages = emptyList(), chatId = null) }
@@ -559,7 +595,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
   fun newChat() {
     if (_state.value.generating) return
     viewModelScope.launch {
-      engine.reset(systemPrompt())
+      if (!speechLoaded) engine.reset(systemPrompt())
       _state.update { it.copy(messages = emptyList(), liveTps = null, chatId = null, conversation = it.conversation + 1) }
     }
   }
@@ -694,6 +730,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val s = _state.value
     if (s.generating || s.phase != Phase.Ready) return
     if (text.isBlank() && s.pending.isEmpty()) return
+    if (speechInUse) return notice(SPEECH_BUSY)
     val atts = s.pending
     atts.firstOrNull { it.media is Media.LongAudio }?.let { return transcribeLong(text.trim(), atts, it) }
     val firstActivity =
@@ -714,6 +751,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     var lastShown = 0L
     genJob =
       viewModelScope.launch {
+        useChatModel()
         val backend = engine.loadedBackend ?: Backend.CPU
         val t0 = System.currentTimeMillis()
         val ramBefore = withContext(Dispatchers.IO) { ProcMem.rssMb() }
@@ -1180,6 +1218,94 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
   }
 
+  /** Downloads LFM3-Audio once when live transcribe is set to use it; it loads only while live transcribe listens. */
+  private fun startSpeech() {
+    if (!_state.value.settings.speechModel || speechJob?.isActive == true) return
+    speechJob =
+      viewModelScope.launch {
+        try {
+          for (m in listOf(Models.SPEECH, Models.SPEECH_MMPROJ).filterNot(store::isReady)) {
+            val mb = m.size shr 20
+            _state.update { it.copy(speechStatus = "Downloading ${m.name.removeSuffix(".gguf")} (0 of $mb MB)") }
+            store.downloadOne(m) { done -> _state.update { it.copy(speechStatus = "Downloading ${m.name.removeSuffix(".gguf")} (${done shr 20} of $mb MB)") } }
+          }
+          _state.update { it.copy(speechStatus = "Ready: live transcribe writes with LFM3-Audio") }
+        } catch (e: Exception) {
+          if (e is kotlinx.coroutines.CancellationException) throw e
+          AppLog.e("LFM3-Audio download failed", e)
+          _state.update { it.copy(speechStatus = "Couldn't download LFM3-Audio: ${e.message}. Live transcribe uses the chat model.") }
+        }
+      }
+  }
+
+  private var speechJob: Job? = null
+
+  // One model fits the NPU at a time (its session maps ~3.1 GB), so live transcribe swaps LFM3-Audio in for the chat
+  // model and the chat model comes back when something needs it. Swaps run one at a time.
+  private val modelSwap = kotlinx.coroutines.sync.Mutex()
+  private var chatModelPath: String? = null
+  private val speechLoaded get() = engine.loadedModel.isNotEmpty() && engine.loadedModel == store.file(Models.SPEECH).path
+  private val liveBusy get() = liveJob?.isActive == true || notesJob?.isActive == true
+  // a swap under way counts: a chat message must not pull the chat model back while live transcribe is loading its own
+  private val speechInUse get() = liveBusy && (speechLoaded || modelSwap.isLocked)
+
+  /** Loads LFM3-Audio for live transcribe. False, with the chat model kept, when it is off, not downloaded or fails. */
+  private suspend fun useSpeechModel(): Boolean =
+    modelSwap.withLock {
+      if (speechLoaded) return@withLock true
+      val s = _state.value.settings
+      if (!s.speechModel || !store.isReady(Models.SPEECH) || !store.isReady(Models.SPEECH_MMPROJ)) return@withLock false
+      val backend = engine.loadedBackend ?: return@withLock false
+      _state.update { it.copy(liveModel = "loading LFM3-Audio") }
+      val t0 = System.currentTimeMillis()
+      try {
+        engine.load(store.file(Models.SPEECH).path, store.file(Models.SPEECH_MMPROJ).path, backend, SPEECH_CTX, s.threads, s.mediaOnGpu)
+        AppLog.i("live transcribe: LFM3-Audio loaded on ${backend.label} in ${System.currentTimeMillis() - t0} ms")
+        _state.update { it.copy(liveModel = "LFM3-Audio") }
+        true
+      } catch (e: EngineException) {
+        AppLog.e("LFM3-Audio failed to load: ${e.message}")
+        notice("The speech model couldn't load, so live transcribe uses the chat model. Details are in Settings > Logs.")
+        reloadChat(backend)
+        false
+      }
+    }
+
+  /** Puts the chat model back after live transcribe; the open conversation is read in again. */
+  private suspend fun useChatModel() = modelSwap.withLock { if (speechLoaded) reloadChat(engine.loadedBackend ?: Backend.CPU) }
+
+  private suspend fun reloadChat(backend: Backend) {
+    val s = _state.value.settings
+    val t0 = System.currentTimeMillis()
+    _state.update { it.copy(liveModel = null, busyMessage = "Loading the chat model…") }
+    try {
+      val nCtx = if (backend.device.startsWith("HTP")) minOf(s.nCtx, NPU_MAX_CTX) else s.nCtx
+      engine.load(chatModelPath ?: store.file(Models.MODEL).path, store.file(Models.MMPROJ).path, backend, nCtx, s.threads, s.mediaOnGpu)
+      // the tools go back into the system turn with the next message
+      offered = listOf("")
+      engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filter { it.activity == Activity.DONE }) })
+      AppLog.i("chat model back on ${backend.label} in ${System.currentTimeMillis() - t0} ms")
+    } catch (e: EngineException) {
+      AppLog.e("chat model reload failed: ${e.message}")
+      _state.update { it.copy(phase = Phase.Failed(e.message ?: "load failed")) }
+    } finally {
+      _state.update { it.copy(busyMessage = null) }
+    }
+  }
+
+  @Volatile private var transcribeOpen = false
+
+  /** The live transcribe page is shown ([open]) or left: once it has stopped (notes included), the chat model comes back. */
+  fun liveShown(open: Boolean) {
+    transcribeOpen = open
+    if (open) return
+    viewModelScope.launch {
+      liveJob?.join()
+      notesJob?.join()
+      if (!transcribeOpen) useChatModel()
+    }
+  }
+
   /** The globe button: search the web for the next messages. Keys are optional (free tiers are used without them). */
   fun toggleWebSearch() {
     val s = _state.value.settings
@@ -1204,7 +1330,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
   fun voiceTap() {
     when (_state.value.voice.phase) {
       VoicePhase.IDLE -> voiceListen()
-      VoicePhase.LISTENING -> voiceSend()
+      // hands-free (camera) listening that hasn't heard anyone yet: the tap pauses the conversation
+      VoicePhase.LISTENING -> if (_state.value.voice.camera && !_state.value.voice.heard) voicePause() else voiceSend()
       VoicePhase.THINKING, VoicePhase.SPEAKING -> {
         stop()
         player.stop()
@@ -1230,13 +1357,86 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
   fun voiceClearPhoto() = _state.update { it.copy(voice = it.voice.copy(photo = null)) }
 
+  // the newest camera frame, kept twice a second by the camera view while the camera is on
+  @Volatile private var cameraFrame: android.graphics.Bitmap? = null
+
+  /** Turns the live camera on or off; a picked photo gives way to it. */
+  fun voiceCamera(on: Boolean) {
+    cameraFrame = null
+    _state.update { it.copy(voice = it.voice.copy(camera = on, photo = if (on) null else it.voice.photo)) }
+  }
+
+  fun voiceFlipCamera() {
+    cameraFrame = null
+    _state.update { it.copy(voice = it.voice.copy(frontCamera = !it.voice.frontCamera)) }
+  }
+
+  fun cameraFrame(frame: android.graphics.Bitmap) {
+    cameraFrame = frame
+  }
+
+  /** The camera frame current now, as a picture for the model (and a small JPEG for the chat to show). */
+  private suspend fun cameraShot(): Attachment? {
+    val frame = cameraFrame ?: return null
+    val app = getApplication<Application>()
+    return withContext(Dispatchers.Default) {
+      runCatching {
+          val scale = minOf(1f, CAMERA_MAX_SIDE.toFloat() / maxOf(frame.width, frame.height))
+          val bmp = if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(frame, (frame.width * scale).toInt(), (frame.height * scale).toInt(), true) else frame
+          val dir = java.io.File(app.cacheDir, "camera").apply { mkdirs() }
+          // the chat shows the picture each question was asked about; only the newest few are kept
+          dir.listFiles().orEmpty().sortedByDescending { it.lastModified() }.drop(CAMERA_KEEP).forEach { it.delete() }
+          val file = java.io.File(dir, "camera-${System.currentTimeMillis()}.jpg")
+          file.outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it) }
+          val px = IntArray(bmp.width * bmp.height)
+          bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+          val rgb = ByteArray(px.size * 3)
+          for (i in px.indices) {
+            val c = px[i]
+            rgb[i * 3] = (c shr 16).toByte()
+            rgb[i * 3 + 1] = (c shr 8).toByte()
+            rgb[i * 3 + 2] = c.toByte()
+          }
+          val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+          Attachment(ids.incrementAndGet(), AttachmentKind.IMAGE, "Camera · $stamp · ${bmp.width}x${bmp.height}", Uri.fromFile(file), Media.Image(rgb, bmp.width, bmp.height))
+        }
+        .onFailure { AppLog.e("camera frame failed", it) }
+        .getOrNull()
+    }
+  }
+
+  private fun voicePause() {
+    voiceMic?.let { m -> voiceMic = null; viewModelScope.launch(Dispatchers.IO) { m.stop() } }
+    _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE, heard = false)) }
+  }
+
+  /**
+   * Hands-free listening for camera conversations: the mic detects speech ([MicRecorder.heardAt]); this sends once you
+   * pause for [PAUSE_MS] (or have talked for [MAX_UTTERANCE_MS]), timed in recorded audio.
+   */
+  private fun sendOnPause(rec: MicRecorder) =
+    viewModelScope.launch {
+      val rate = engine.audioSampleRate
+      while (voiceMic === rec && _state.value.voice.phase == VoicePhase.LISTENING) {
+        delay(100)
+        if (rec.heardAt < 0) continue
+        if (!_state.value.voice.heard) _state.update { it.copy(voice = it.voice.copy(heard = true)) }
+        val pos = rec.position
+        if (pos - rec.lastVoiceAt >= rate.toLong() * PAUSE_MS / 1000 || pos - rec.heardAt >= rate.toLong() * MAX_UTTERANCE_MS / 1000) {
+          voiceSend()
+          break
+        }
+      }
+    }
+
   /** Leaving the voice screen: stop listening and speaking. */
   fun voiceClose() {
     // a live transcript outlives the screen: it keeps listening in the background until stopped, and stays to be saved
     voiceMic?.let { m -> voiceMic = null; viewModelScope.launch(Dispatchers.IO) { m.stop() } }
     if (_state.value.voice.phase != VoicePhase.IDLE && _state.value.voice.phase != VoicePhase.LISTENING) stop()
     player.stop()
-    _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE)) }
+    cameraFrame = null
+    _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE, camera = false)) }
     // the speech context holds ~350 MB of NPU memory; give it back until voice chat is used again
     viewModelScope.launch {
       genJob?.join()
@@ -1300,6 +1500,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     AppLog.i("live transcribe: $seconds s blocks")
     liveJob =
       viewModelScope.launch {
+        // the mic is already recording: what is said while LFM3-Audio loads is written down once it is in
+        if (!useSpeechModel()) _state.update { it.copy(liveModel = null) }
         var buf = FloatArray(0)
         var consumed = 0L
         while (true) {
@@ -1369,6 +1571,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
           if (step == null) {
             if (!l.running && notesJob?.isActive == true && liveJob?.isActive != true) break
             delay(500)
+            continue
+          }
+          // LFM3-Audio only transcribes (asked for notes it found 0 of 5 action items and looped): while it listens the
+          // notes wait, and once listening is over the chat model comes back and writes them for the whole meeting
+          if (speechLoaded || modelSwap.isLocked) {
+            if (l.running || liveJob?.isActive == true) {
+              delay(500)
+              continue
+            }
+            useChatModel()
             continue
           }
           if (l.running && !liveWaiting) {
@@ -1477,6 +1689,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
   /** Writes a summary now (while listening it waits for a pause between pieces). */
   fun liveSummarize() {
     val l = _state.value.voice.live ?: return
+    if (l.running && speechInUse) return notice("The notes and summary are written when you stop: the speech model only transcribes.")
     summaryWanted = true
     updateNotes { it.copy(summary = null) }
     if (notesJob?.isActive != true) startNotes()
@@ -1558,6 +1771,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     summaryWanted = false
     _state.update { it.copy(voice = it.voice.copy(live = null)) }
     viewModelScope.launch(Dispatchers.IO) { liveSaveLock.withLock { liveFile.delete() } }
+    viewModelScope.launch {
+      liveJob?.join()
+      notesJob?.join()
+      useChatModel()
+    }
   }
 
   /** What a saved transcript holds. */
@@ -1617,6 +1835,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
   private fun voiceListen() {
     if (_state.value.phase != Phase.Ready || _state.value.generating || _state.value.voice.live?.running == true) return
+    if (speechInUse) return notice(SPEECH_BUSY)
+    if (voiceMic != null) return
     player.stop()
     val rec = MicRecorder(engine.audioSampleRate)
     if (!rec.start()) {
@@ -1624,7 +1844,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       return _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE)) }
     }
     voiceMic = rec
-    _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.LISTENING)) }
+    _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.LISTENING, heard = false)) }
+    if (_state.value.voice.camera) sendOnPause(rec)
   }
 
   private fun voiceSend() {
@@ -1633,27 +1854,44 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     viewModelScope.launch {
       val pcm = withContext(Dispatchers.IO) { rec.stop() }
       if (pcm.size < engine.audioSampleRate / 3) {
-        _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE)) }
+        _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE, heard = false)) }
         return@launch
       }
       val s = _state.value
-      val photo = s.voice.photo
+      // with the live camera on, the frame current as you finished asking; else a photo you picked, if any
+      val shot = if (s.voice.camera) cameraShot() else null
+      if (s.voice.camera && shot == null) notice("The camera had no picture yet, so this went without one.")
+      val photo = shot ?: s.voice.photo
       val atts = listOfNotNull(photo, Attachment(ids.incrementAndGet(), AttachmentKind.AUDIO, "Spoken · ${seconds(pcm.size)}", null, Media.Audio(pcm)))
       val user = ChatMessage(ids.incrementAndGet(), Role.USER, "", atts)
       val reply = ChatMessage(ids.incrementAndGet(), Role.ASSISTANT, "", activity = Activity.LISTENING, live = LiveStats())
-      _state.update { it.copy(messages = it.messages + user + reply, generating = true, voice = VoiceUi(VoicePhase.THINKING, "", null)) }
+      _state.update { it.copy(messages = it.messages + user + reply, generating = true, voice = it.voice.copy(phase = VoicePhase.THINKING, reply = "", photo = null, heard = false, speed = null)) }
       val app = getApplication<Application>()
       GenerationService.start(app, "Listening to you")
       stopRequested = false
       val lang = (VoiceLanguages[s.settings.voiceLang] ?: "English").substringBefore(" (")
       // The reply is written as text and each sentence is read out in LFM3's TTS mode, the only mode where the
       // voice (female/male) and language can be chosen; the mixed text+speech mode always uses its default voice.
-      val instruction = "(We are talking out loud. Reply in $lang, briefly and conversationally, in plain spoken sentences: no lists, markdown or emoji.)"
+      val seeing =
+        if (shot != null) " The newest picture is what my phone's camera sees right now; answer about it when my question is about what I'm showing you. Earlier pictures are what it saw before." else ""
+      val instruction = "(We are talking out loud.$seeing Reply in $lang, briefly and conversationally, in plain spoken sentences: no lists, markdown or emoji.)"
       genJob =
         viewModelScope.launch {
+          useChatModel()
           // what is shown and saved: the spoken text, without tool calls
           val text = StringBuilder()
+          var failed = false
+          var rebuild = false
           try {
+            // a camera conversation adds a picture (~1k tokens) every turn: before the context fills, the chat is
+            // rebuilt from its text, earlier pictures kept only by name with what was said about them
+            if (shot != null) {
+              val (used, size) = engine.context()
+              if (size > 0 && used + CAMERA_TURN_ROOM > size) {
+                AppLog.i("camera chat: context $used of $size, rebuilt from text")
+                engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) })
+              }
+            }
             var turnText = if (offered.isNotEmpty()) instruction + TOOL_HINT else instruction
             var turnMedia = atts.map { it.media }
             var role = "user"
@@ -1665,7 +1903,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
               val raw = StringBuilder()
               engine.speak(turnText, turnMedia, s.settings.temperature, 400, s.settings.voiceLang, s.settings.voiceGender, role).collect { ev ->
               when (ev) {
-                is VoiceEvent.Prefilled -> updateReply(reply.id) { it.copy(activity = Activity.THINKING) }
+                is VoiceEvent.Prefilled -> {
+                  updateReply(reply.id) { it.copy(activity = Activity.THINKING) }
+                  // a tool result's turn adds to the first read rather than replacing it
+                  _state.update { st ->
+                    val was = st.voice.speed
+                    st.copy(voice = st.voice.copy(speed = VoiceSpeed((was?.promptTokens ?: 0) + ev.promptTokens, (was?.readMillis ?: 0) + ev.millis, was?.tokensPerSecond, was?.realTime)))
+                  }
+                }
+                is VoiceEvent.Speed ->
+                  _state.update { st ->
+                    st.copy(voice = st.voice.copy(speed = (st.voice.speed ?: VoiceSpeed(0, 0)).copy(
+                      tokensPerSecond = if (ev.writeMillis > 0) ev.tokens * 1000f / ev.writeMillis else null,
+                      realTime = if (ev.speechMillis > 0) (ev.audioSeconds * 1000 / ev.speechMillis).toFloat() else null,
+                    )))
+                  }
                 is VoiceEvent.Text -> {
                   raw.append(ev.text)
                   val shown = uncited(text.toString() + raw.toString().substringBefore("<tool_call>"), sources)
@@ -1695,17 +1947,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
               role = "tool"
             }
           } catch (e: EngineException) {
+            failed = true
             AppLog.e("voice reply failed: ${e.message}")
             updateReply(reply.id) { it.copy(text = text.toString().ifEmpty { e.message ?: "Couldn't answer" }, error = text.isEmpty()) }
-            if (e.needsReset) engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) })
+            if (e.needsReset) rebuild = true
           } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
           } catch (e: Throwable) {
             // the speaker couldn't start, a tool threw...: the reply fails, the app stays up
+            failed = true
             AppLog.e("voice reply failed", e)
             updateReply(reply.id) { it.copy(text = text.toString().ifEmpty { "Something went wrong: ${e.message ?: e.javaClass.simpleName}" }, error = text.isEmpty()) }
           } finally {
             runCatching { player.finish() }
+            // a stop while speaking can cut a decode of the chat itself short (its positions are then off by one and the
+            // next question fails): a failed or stopped spoken reply rebuilds the chat from its text
+            if (rebuild || stopRequested) {
+              runCatching { engine.reset(systemPrompt(), withContext(Dispatchers.Default) { modelHistory(_state.value.messages.filterNot { it.id == user.id || it.id == reply.id }) }) }
+                .onFailure { AppLog.e("voice: chat rebuild failed", it) }
+            }
             updateReply(reply.id) { it.copy(activity = Activity.DONE) }
             dropMedia(user.id)
             _state.update { it.copy(generating = false) }
@@ -1715,6 +1975,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             while (player.isPlaying) delay(100)
             if (_state.value.voice.phase == VoicePhase.SPEAKING || _state.value.voice.phase == VoicePhase.THINKING) {
               _state.update { it.copy(voice = it.voice.copy(phase = VoicePhase.IDLE)) }
+              // a camera conversation goes on by itself: listening again once the answer has been said
+              if (_state.value.voice.camera && !failed && !stopRequested) voiceListen()
             }
           }
         }
@@ -1748,6 +2010,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     genJob =
       viewModelScope.launch {
+        useChatModel()
         // the transcriber needs no tools (their descriptions are ~1k tokens per part); the next message puts them back
         if (offered.isNotEmpty()) {
           offered = emptyList()
@@ -1882,6 +2145,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       voiceGender = prefs.getString("voiceGender", "female") ?: "female",
       liveSeconds = prefs.getInt("liveSeconds", LIVE_SECONDS_DEFAULT).coerceIn(LIVE_SECONDS_RANGE),
       meetingNotes = prefs.getBoolean("meetingNotes", true),
+      voiceSpeed = prefs.getBoolean("voiceSpeed", true),
+      speechModel = prefs.getBoolean("speechModel", true),
       phoneTools = prefs.getBoolean("phoneTools", true),
       smartSearch = prefs.getBoolean("smartSearch", false),
       gallerySearch = prefs.getBoolean("gallerySearch", false),
@@ -1908,6 +2173,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
       .putString("voiceGender", s.voiceGender)
       .putInt("liveSeconds", s.liveSeconds)
       .putBoolean("meetingNotes", s.meetingNotes)
+      .putBoolean("voiceSpeed", s.voiceSpeed)
+      .putBoolean("speechModel", s.speechModel)
       .putBoolean("phoneTools", s.phoneTools)
       .putBoolean("smartSearch", s.smartSearch)
       .putBoolean("gallerySearch", s.gallerySearch)

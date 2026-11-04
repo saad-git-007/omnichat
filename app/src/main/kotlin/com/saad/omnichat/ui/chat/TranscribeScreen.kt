@@ -92,6 +92,11 @@ fun TranscribeScreen(vm: ChatViewModel, onBack: () -> Unit) {
   val saveMarkdown = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { vm.liveSave(it, saveFormat) }
   val saveSubtitles = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { vm.liveSave(it, saveFormat) }
   var tab by remember { mutableStateOf(0) }
+  // leaving the page lets the chat model come back once listening and notes are done
+  androidx.compose.runtime.DisposableEffect(Unit) {
+    vm.liveShown(true)
+    onDispose { vm.liveShown(false) }
+  }
   var searching by remember { mutableStateOf(false) }
   var query by remember { mutableStateOf("") }
 
@@ -109,7 +114,7 @@ fun TranscribeScreen(vm: ChatViewModel, onBack: () -> Unit) {
         Column(Modifier.weight(1f)) {
           Text("Live transcribe", style = MaterialTheme.typography.titleMedium)
           Text(
-            "${VoiceLanguages[state.settings.voiceLang] ?: "English"} · written down on this phone",
+            "${VoiceLanguages[state.settings.voiceLang] ?: "English"} · " + (state.liveModel?.let { if (it.startsWith("loading")) "$it…" else "written down by $it" } ?: "written down on this phone"),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
@@ -134,7 +139,7 @@ fun TranscribeScreen(vm: ChatViewModel, onBack: () -> Unit) {
           }
         }
         if (tab == 1 && showNotes) {
-          NotesPanel(live, state.settings.meetingNotes, onSummarize = vm::liveSummarize, modifier = Modifier.weight(1f).fillMaxWidth())
+          NotesPanel(live, state.settings.meetingNotes, afterStop = state.liveModel != null, onSummarize = vm::liveSummarize, modifier = Modifier.weight(1f).fillMaxWidth())
         } else {
           if (searching) {
             OutlinedTextField(
@@ -329,13 +334,14 @@ private fun highlight(text: String, query: String): AnnotatedString = buildAnnot
 
 /** Action items, decisions, key points by the minute and the summary, as they are written. */
 @Composable
-private fun NotesPanel(live: LiveTranscript, on: Boolean, onSummarize: () -> Unit, modifier: Modifier) {
+private fun NotesPanel(live: LiveTranscript, on: Boolean, afterStop: Boolean, onSummarize: () -> Unit, modifier: Modifier) {
   val n = live.notes
   Column(modifier.padding(top = 12.dp)) {
     Text(
       when {
         !on -> "Meeting notes are off in Settings; these are from before"
-        live.noting -> "Writing notes between pieces…"
+        live.noting -> if (live.running) "Writing notes between pieces…" else "Writing the notes…"
+        live.running && afterStop -> "Written when you stop: LFM3-Audio transcribes, then the chat model writes the notes"
         live.running -> "Noted between pieces, without slowing the transcript"
         n.summary == null && n.points.size >= 2 -> "Writing a summary…"
         else -> "Saving or copying \"Notes and transcript\" includes these"
@@ -347,7 +353,8 @@ private fun NotesPanel(live: LiveTranscript, on: Boolean, onSummarize: () -> Uni
     if (n.isEmpty) {
       Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
         Text(
-          "Action items, decisions and the key points of each minute appear here as the meeting goes on.",
+          if (live.running && afterStop) "Action items, decisions, the key points of each minute and a summary appear here when you stop."
+          else "Action items, decisions and the key points of each minute appear here as the meeting goes on.",
           style = MaterialTheme.typography.bodyLarge,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
           textAlign = TextAlign.Center,

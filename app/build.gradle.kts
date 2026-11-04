@@ -12,8 +12,8 @@ android {
     applicationId = "com.saad.omnichat"
     minSdk = 33
     targetSdk = 37
-    versionCode = 36
-    versionName = "1.35"
+    versionCode = 38
+    versionName = "1.37"
 
     ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     externalNativeBuild {
@@ -119,6 +119,10 @@ dependencies {
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.coil.compose)
+  // live camera in voice chat
+  implementation(libs.androidx.camera.camera2)
+  implementation(libs.androidx.camera.lifecycle)
+  implementation(libs.androidx.camera.view)
   // PDF text extraction for document attachments
   implementation(libs.pdfbox.android)
 }

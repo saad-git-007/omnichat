@@ -14,6 +14,22 @@ class MicRecorder(private val rate: Int) {
 
   val isRecording get() = running
 
+  // Voice detection, done on every 50 ms chunk and timed in samples (a busy UI thread mustn't miss a word):
+  // a quarter second of voice well above the room's level starts an utterance; before that only the last second is
+  // kept, so a long wait doesn't become audio for the model to read.
+  /** Samples recorded since [start]. */
+  @Volatile var position = 0L
+    private set
+  /** Where an utterance was first heard, or -1. */
+  @Volatile var heardAt = -1L
+    private set
+  /** Where the voice was last heard. */
+  @Volatile var lastVoiceAt = 0L
+    private set
+  private var floor = 1f
+  private var voiced = 0
+  private var unvoiced = 0
+
   /** Live input level 0..1 (dBFS mapped from -50..-10 dB), for visualisers. */
   @Volatile
   var level = 0f
@@ -39,6 +55,12 @@ class MicRecorder(private val rate: Int) {
         .onFailure { com.saad.omnichat.AppLog.w("mic: ${it.message}") }
         .getOrNull() ?: return false
     chunks.clear()
+    position = 0L
+    heardAt = -1L
+    lastVoiceAt = 0L
+    floor = 1f
+    voiced = 0
+    unvoiced = 0
     running = true
     worker =
       thread(name = "mic") {
@@ -51,6 +73,7 @@ class MicRecorder(private val rate: Int) {
             for (i in 0 until n) sum += buf[i] * buf[i]
             val db = 10 * kotlin.math.log10(sum / n + 1e-12)
             level = ((db + 50) / 40).toFloat().coerceIn(0f, 1f)
+            detectVoice(level, n)
           } else if (n < 0) {
             // the audio server went away (ERROR_DEAD_OBJECT): reading again would spin at full speed, getting nothing
             com.saad.omnichat.AppLog.w("mic: read failed ($n), stopping")
@@ -75,6 +98,33 @@ class MicRecorder(private val rate: Int) {
     running = false
     worker?.join()
     worker = null
+  }
+
+  private fun detectVoice(level: Float, n: Int) {
+    // the room's level follows quiet at once and noise only slowly, so a long sentence doesn't become the floor
+    floor = if (level < floor) level else floor + (level - floor) * 0.01f
+    position += n
+    if (level > 0.3f && level > floor + 0.2f) {
+      voiced += n
+      unvoiced = 0
+      lastVoiceAt = position
+      if (heardAt < 0 && voiced >= rate / 4) heardAt = position - voiced
+    } else {
+      unvoiced += n
+      // a gap between syllables doesn't restart the count; a third of a second of quiet does
+      if (unvoiced > rate / 3) voiced = 0
+      if (heardAt < 0 && voiced == 0) keepLast(rate)
+    }
+  }
+
+  /** Forgets all but the last [samples] recorded (the quiet before someone starts talking). */
+  fun keepLast(samples: Int) {
+    synchronized(chunks) {
+      var kept = 0
+      var i = chunks.size
+      while (i > 0 && kept < samples) kept += chunks[--i].size
+      repeat(i) { chunks.removeAt(0) }
+    }
   }
 
   /** Returns and forgets what was recorded so far, without stopping (live transcription reads it in pieces). */

@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,11 +29,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.AddPhotoAlternate
+import androidx.compose.material.icons.outlined.Cameraswitch
+import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material.icons.outlined.VideocamOff
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -72,6 +77,14 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
     if (voice.phase == VoicePhase.IDLE && !hasMic(context)) micPermission.launch(android.Manifest.permission.RECORD_AUDIO) else vm.voiceTap()
   }
   DisposableEffect(Unit) { onDispose { vm.voiceClose() } }
+  val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) vm.voiceCamera(true) }
+  val toggleCamera = {
+    when {
+      voice.camera -> vm.voiceCamera(false)
+      hasCamera(context) -> vm.voiceCamera(true)
+      else -> cameraPermission.launch(android.Manifest.permission.CAMERA)
+    }
+  }
 
   VoiceGlow(
     level = vm::voiceLevel,
@@ -96,7 +109,20 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
 
       Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-          ThinkingOrb(
+          if (voice.camera) {
+            // what the model will see: the frame current when you finish asking goes with your question
+            Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f, matchHeightConstraintsFirst = true).weight(1f, fill = false).clip(MaterialTheme.shapes.extraLarge)) {
+              VoiceCamera(voice.frontCamera, vm::cameraFrame, Modifier.fillMaxSize())
+              IconButton(
+                onClick = vm::voiceFlipCamera,
+                modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).size(44.dp).clip(CircleShape).background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.45f)),
+              ) {
+                Icon(Icons.Outlined.Cameraswitch, "Switch camera", tint = androidx.compose.ui.graphics.Color.White)
+              }
+            }
+            Spacer(Modifier.height(14.dp))
+          }
+          if (!voice.camera) ThinkingOrb(
             when (voice.phase) {
               VoicePhase.LISTENING -> OrbMode.LISTENING
               VoicePhase.THINKING -> OrbMode.THINKING
@@ -106,17 +132,32 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
             Modifier.size(190.dp),
           )
           Spacer(Modifier.height(20.dp))
-          AnimatedContent(voice.phase, transitionSpec = { fadeIn(tween(180, easing = ExpoOut)) togetherWith fadeOut(tween(100)) }, label = "voicePhase") { p ->
+          val status =
+            when {
+              state.phase !is Phase.Ready -> "The model is loading…"
+              voice.phase == VoicePhase.IDLE && voice.camera -> "Show it something and tap the microphone: then just talk, it answers and listens again"
+              voice.phase == VoicePhase.IDLE -> "Tap the microphone and talk"
+              voice.phase == VoicePhase.LISTENING && voice.camera && voice.heard -> "Hearing you… it answers when you pause"
+              voice.phase == VoicePhase.LISTENING && voice.camera -> "Listening… ask about what you're showing (tap to pause)"
+              voice.phase == VoicePhase.LISTENING -> "Listening… tap again when you're done"
+              voice.phase == VoicePhase.THINKING -> "Thinking…"
+              else -> "Speaking · tap to interrupt"
+            }
+          AnimatedContent(status, transitionSpec = { fadeIn(tween(180, easing = ExpoOut)) togetherWith fadeOut(tween(100)) }, label = "voicePhase") { text ->
             Text(
-              when {
-                state.phase !is Phase.Ready -> "The model is loading…"
-                p == VoicePhase.IDLE -> "Tap the microphone and talk"
-                p == VoicePhase.LISTENING -> "Listening… tap again when you're done"
-                p == VoicePhase.THINKING -> "Thinking…"
-                else -> "Speaking · tap to interrupt"
-              },
+              text,
               style = MaterialTheme.typography.titleMedium,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
+              textAlign = TextAlign.Center,
+            )
+          }
+          val speed = voice.speed
+          if (state.settings.voiceSpeed && speed != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+              speedLine(speed),
+              style = MaterialTheme.typography.labelMedium,
+              color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
               textAlign = TextAlign.Center,
             )
           }
@@ -138,7 +179,9 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
         // a photo to talk about, sent with the next thing you say
         Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
           val photo = voice.photo
-          if (photo != null) {
+          if (voice.camera) {
+            // the camera stands in for a picked photo
+          } else if (photo != null) {
             AsyncImage(photo.uri, photo.label, contentScale = ContentScale.Crop, modifier = Modifier.size(56.dp).clip(CircleShape))
             IconButton(onClick = vm::voiceClearPhoto, modifier = Modifier.align(Alignment.TopEnd).size(22.dp).clip(CircleShape).background(MaterialTheme.colorScheme.inverseSurface)) {
               Icon(Icons.Default.Close, "Remove photo", Modifier.size(14.dp), tint = MaterialTheme.colorScheme.inverseOnSurface)
@@ -163,12 +206,12 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
             Icon(
               when (p) {
                 VoicePhase.IDLE -> Icons.Default.Mic
-                VoicePhase.LISTENING -> Icons.Default.ArrowUpward
+                VoicePhase.LISTENING -> if (voice.camera && !voice.heard) Icons.Default.Pause else Icons.Default.ArrowUpward
                 else -> Icons.Default.Stop
               },
               when (p) {
                 VoicePhase.IDLE -> "Talk"
-                VoicePhase.LISTENING -> "Send what you said"
+                VoicePhase.LISTENING -> if (voice.camera && !voice.heard) "Pause the conversation" else "Send what you said"
                 else -> "Interrupt"
               },
               Modifier.size(34.dp),
@@ -176,12 +219,27 @@ fun VoiceScreen(vm: ChatViewModel, onBack: () -> Unit) {
           }
         }
 
-        // keeps the talk button centred
-        Spacer(Modifier.size(64.dp))
+        // the live camera: show the model what you're asking about
+        Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
+          IconButton(onClick = toggleCamera, modifier = Modifier.size(56.dp).glass(CircleShape, lift = 6.dp)) {
+            Icon(if (voice.camera) Icons.Outlined.VideocamOff else Icons.Outlined.Videocam, if (voice.camera) "Turn the camera off" else "Show the model with the camera")
+          }
+        }
       }
     }
   }
 }
 
+internal fun hasCamera(context: android.content.Context) =
+  androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
 internal fun hasMic(context: android.content.Context) =
   androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+/** "Read 899 tokens in 2.1 s · 14.2 tok/s · voice 2.3× real time" */
+internal fun speedLine(v: com.saad.omnichat.ui.chat.VoiceSpeed): String =
+  listOfNotNull(
+    "Read ${v.promptTokens} tokens in %.1f s".format(v.readMillis / 1000f),
+    v.tokensPerSecond?.let { "%.1f tok/s".format(it) },
+    v.realTime?.let { (if (it < 1f) "voice %.2f× real time" else "voice %.1f× real time").format(it) },
+  ).joinToString(" · ")

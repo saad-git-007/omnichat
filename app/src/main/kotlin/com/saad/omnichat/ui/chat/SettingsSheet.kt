@@ -162,6 +162,12 @@ fun SettingsSheet(state: UiState, onDismiss: () -> Unit, onSave: (Settings) -> U
         }
       }
 
+      ToggleRow(
+        "Show speed in voice chat",
+        "A small line under the status: how long it took to read what you showed and said, how fast it writes (tokens per second, counted only while writing) and how fast the voice is made (above 1× real time it never has to pause). Showing it doesn't slow anything down.",
+        s.voiceSpeed,
+      ) { s = s.copy(voiceSpeed = it) }
+
       HorizontalDivider()
       Text("Live transcribe", style = MaterialTheme.typography.titleMedium)
       Text("Writes down every ${s.liveSeconds} seconds")
@@ -182,6 +188,26 @@ fun SettingsSheet(state: UiState, onDismiss: () -> Unit, onSave: (Settings) -> U
         "Action items, decisions and the key points of each minute, noted between pieces while it listens, and a summary when you stop. Transcription always comes first.",
         s.meetingNotes,
       ) { s = s.copy(meetingNotes = it) }
+      Text("Live transcribe model")
+      SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        listOf(false to "Omni · live notes", true to "Audio · faster").forEachIndexed { i, (v, label) ->
+          SegmentedButton(
+            selected = s.speechModel == v,
+            onClick = { s = s.copy(speechModel = v) },
+            shape = SegmentedButtonDefaults.itemShape(i, 2),
+            label = { Text(label) },
+          )
+        }
+      }
+      Text(
+        if (s.speechModel)
+          "LFM3-Audio, a speech model: about a fifth faster, with fewer mistakes in noisy rooms. It takes the chat model's place while it listens (a few seconds to swap), so action items and notes are written when you stop. Downloads 1.35 GB once."
+        else "LFM3-Omni, the chat model: action items, decisions and key points appear while the meeting is still going. No model swap, nothing extra to download.",
+        style = MaterialTheme.typography.bodySmall,
+      )
+      state.speechStatus?.takeIf { s.speechModel }?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = com.saad.omnichat.ui.theme.accentText())
+      }
 
       HorizontalDivider()
       Text("Phone tools", style = MaterialTheme.typography.titleMedium)

@@ -18,6 +18,8 @@ data class ModelFile(val name: String, val size: Long, val sha256: String, val r
 
 private const val OCR_REPO = "richardyoung/Xiaomi-OCR-0-GGUF"
 private const val OCR_REV = "a0cb6d2813d1bf778f06d22bb7a78e35bc4287b8"
+private const val SPEECH_REPO = "LiquidAI/LFM3-Audio-2B-GGUF"
+private const val SPEECH_REV = "39670cb5c42e9c4bfe046519ba7ffbe47f9552ad"
 
 object Models {
   val MODEL = ModelFile("LFM3-Omni-2B-Q4_0.gguf", 1_049_617_920, "6d2273a383b92dd7c5db0eb4c8dfeae13e805b485a6621c4b391ae179c2b5f28")
@@ -38,6 +40,14 @@ object Models {
 
   /** Its image tower, in f16: fast on the CPU and OpenCL as downloaded (bf16 had to be converted on the phone). */
   val OCR_VISION = ModelFile("mmproj-Xiaomi-OCR-0-F16.gguf", 204_987_264, "cd6a69a6fd4c36dbc5ca56bd1a5b9cfca3deb2043e645e95b8491e2fc0f29659", OCR_REPO, OCR_REV)
+
+  /**
+   * LFM3-Audio-2B (LFM Open License): the speech model live transcribe swaps in for the chat model. Measured against
+   * LFM3-Omni on the same 73 LibriSpeech clips: the same word error rate on clean speech (5.7%), a fifth fewer errors
+   * in noise (12.5% vs 15.5% at 5 dB) and 18-27% faster. Optional.
+   */
+  val SPEECH = ModelFile("LFM3-Audio-2B-Q4_0.gguf", 1_049_613_856, "112e4acb79be79dcd8df5749495614817e51c064cd9ca576aead02b64b2b7584", SPEECH_REPO, SPEECH_REV)
+  val SPEECH_MMPROJ = ModelFile("mmproj-LFM3-Audio-2B-Q8_0.gguf", 303_811_840, "2b6648b1fd48af16aa0877b0592b144d15070783673e038a379fdbc51d40e365", SPEECH_REPO, SPEECH_REV)
 
   /** Files of the OCR model used before (MiniCPM-OCR 1.0), deleted on the first start after the switch. */
   val OLD_OCR = listOf("MiniCPM-OCR-1_0-Q4_K_M.gguf", "mmproj-model-f16-4x.gguf", "mmproj-MiniCPM-OCR-1_0-Q8_0.gguf", "mmproj-MiniCPM-OCR-1_0-Q8_0.gguf.part")
